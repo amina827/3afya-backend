@@ -73,6 +73,7 @@ class ImageUploadView(APIView):
         scan_image = ScanImage.objects.create(scan=scan, original_image=image)
 
         process_scan_image.delay(str(scan.id))
+        scan.refresh_from_db()
 
         return Response({"scan_id": str(scan.id), "status": scan.status}, status=status.HTTP_201_CREATED)
 

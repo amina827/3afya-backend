@@ -1,11 +1,16 @@
+import logging
+
 from celery import shared_task
 from django.db import transaction
 from .models import ScanSession, ScanImage
 from .services.image_processing import process_bottle_image, ProcessingError
 
+logger = logging.getLogger(__name__)
 
-@shared_task(bind=True)
+
+@shared_task(bind=True, max_retries=3)
 def process_scan_image(self, scan_id: str):
+    logger.info("Starting scan processing: %s", scan_id)
     scan = ScanSession.objects.select_related("bottle").get(id=scan_id)
     scan.status = ScanSession.STATUS_PROCESSING
     scan.save(update_fields=["status", "updated_at"])
@@ -28,7 +33,9 @@ def process_scan_image(self, scan_id: str):
 
             scan.status = ScanSession.STATUS_DONE
             scan.save(update_fields=["status", "updated_at"])
-    except (ProcessingError, FileNotFoundError, ScanImage.DoesNotExist):
+        logger.info("Scan completed: %s (oil=%.1f%%)", scan_id, result["oil_ratio"] * 100)
+    except (ProcessingError, FileNotFoundError, ScanImage.DoesNotExist) as exc:
+        logger.error("Scan failed: %s - %s", scan_id, exc)
         scan.status = ScanSession.STATUS_FAILED
         scan.save(update_fields=["status", "updated_at"])
-        raise
+        raise self.retry(exc=exc, countdown=5)
