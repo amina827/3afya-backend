@@ -47,7 +47,7 @@ REFERENCE_LEVELS = [
     ("level_057.jpg", 57), ("level_052.jpg", 52), ("level_048.jpg", 48),
     ("level_043.jpg", 43), ("level_038.jpg", 38), ("level_033.jpg", 33),
     ("level_029.jpg", 29), ("level_024.jpg", 24), ("level_019.jpg", 19),
-    ("level_014.jpg", 14), ("level_010.jpg", 10),
+    ("level_014.jpg", 14), ("level_010.jpg", 10), ("level_010b.jpg", 10),
 ]
 
 REFERENCE_DIR = Path(settings.MEDIA_ROOT) / "reference_levels"
@@ -189,21 +189,37 @@ def _compare(img1, img2):
     cv2.normalize(hh2, hh2)
     hsv_score = float(cv2.compareHist(hh1, hh2, cv2.HISTCMP_CORREL))
 
-    # D: Full histogram
-    hist_scores = []
-    for ch in range(3):
-        h1 = cv2.calcHist([img1], [ch], None, [64], [0, 256])
-        h2 = cv2.calcHist([img2], [ch], None, [64], [0, 256])
-        cv2.normalize(h1, h1)
-        cv2.normalize(h2, h2)
-        hist_scores.append(float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)))
-    hist_score = float(np.mean(hist_scores))
+    # D: Golden oil amount comparison (how much oil is visible)
+    def golden_ratio(img):
+        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv_img, np.array([10, 25, 25]), np.array([40, 255, 255]))
+        return mask.sum() / (mask.shape[0] * mask.shape[1] * 255)
+
+    g1 = golden_ratio(img1)
+    g2 = golden_ratio(img2)
+    golden_diff = abs(g1 - g2)
+    golden_sim = max(0.0, 1.0 - golden_diff * 5.0)
+
+    # E: Row-by-row golden profile (WHERE is oil vertically)
+    def golden_profile(img):
+        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv_img, np.array([10, 25, 25]), np.array([40, 255, 255]))
+        profile = mask.mean(axis=1) / 255.0
+        ks = 15
+        return np.convolve(profile, np.ones(ks) / ks, mode="same")
+
+    gp1 = golden_profile(img1)
+    gp2 = golden_profile(img2)
+    min_len = min(len(gp1), len(gp2))
+    gp_diff = float(np.mean(np.abs(gp1[:min_len] - gp2[:min_len])))
+    gp_sim = max(0.0, 1.0 - gp_diff * 4.0)
 
     combined = (
-        upper_sim * 0.35 +
-        max(0, bright_corr) * 0.30 +
-        max(0, hsv_score) * 0.20 +
-        max(0, hist_score) * 0.15
+        upper_sim * 0.25 +
+        max(0, bright_corr) * 0.20 +
+        max(0, hsv_score) * 0.15 +
+        golden_sim * 0.20 +
+        gp_sim * 0.20
     )
 
     return combined
@@ -222,7 +238,9 @@ def _build_cache():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for filename, level in REFERENCE_LEVELS:
-        npy_path = cache_dir / f"ref_{level:03d}.npy"
+        # Use filename stem for cache key (supports multiple images per level)
+        stem = Path(filename).stem
+        npy_path = cache_dir / f"{stem}.npy"
         if npy_path.exists():
             continue
 
@@ -238,8 +256,8 @@ def _build_cache():
             bottle, _ = _crop_bottle(img)
             normalized = _normalize(bottle)
             np.save(str(npy_path), normalized)
-            cv2.imwrite(str(cache_dir / f"ref_{level:03d}.jpg"), normalized)
-            logger.info("Cached reference: %s -> ref_%03d", filename, level)
+            cv2.imwrite(str(cache_dir / f"{stem}.jpg"), normalized)
+            logger.info("Cached reference: %s -> %s", filename, stem)
         except ProcessingError as e:
             logger.warning("Failed to cache %s: %s", filename, e)
 
@@ -256,8 +274,9 @@ def _load_references():
     cache_dir = CACHE_DIR
     references = []
 
-    for _, level in REFERENCE_LEVELS:
-        npy_path = cache_dir / f"ref_{level:03d}.npy"
+    for filename, level in REFERENCE_LEVELS:
+        stem = Path(filename).stem
+        npy_path = cache_dir / f"{stem}.npy"
         if npy_path.exists():
             normalized = np.load(str(npy_path))
             references.append({"level": level, "normalized": normalized})
