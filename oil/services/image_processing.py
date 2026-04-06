@@ -60,71 +60,134 @@ STD_SIZE = (200, 500)  # width, height
 # =====================================================================
 
 def _detect_bottle(image):
-    """Detect bottle using HSV colors + edge detection fusion."""
+    """Detect the FULL bottle including transparent glass neck.
+
+    Strategy:
+    1. HSV colors detect oil + label + cap (colored parts)
+    2. Edge detection finds the transparent glass outline (neck, body)
+    3. Extend vertically: scan UP from color region using edges to find bottle top
+    4. Extend vertically: scan DOWN to find bottle base
+    5. Result: full bottle from cap to base
+    """
     h, w = image.shape[:2]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # HSV color masks for bottle parts
+    # --- Phase 1: Find colored region (oil + label + cap) ---
     oil = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
     green = cv2.inRange(hsv, np.array([35, 35, 25]), np.array([85, 255, 255]))
     red1 = cv2.inRange(hsv, np.array([0, 40, 40]), np.array([12, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([160, 40, 40]), np.array([180, 255, 255]))
     color_mask = oil | green | red1 | red2
 
-    # Edge detection for bottle outline (catches transparent glass too)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    kernel = np.ones((15, 15), np.uint8)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=4)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Get bounding box of colored region
+    color_contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not color_contours:
+        raise ProcessingError("No bottle colors detected")
+
+    # Pick best color contour (tall + centered)
+    img_area = h * w
+    best_color = None
+    best_score = -1
+    for c in color_contours:
+        cx, cy, ccw, cch = cv2.boundingRect(c)
+        if ccw == 0 or cch == 0:
+            continue
+        aspect = cch / ccw
+        area_pct = (ccw * cch) / img_area
+        center = (cx + ccw / 2) / w
+        if area_pct > 0.02:
+            score = aspect * 0.4 + (1 - abs(center - 0.5)) * 0.3 + min(area_pct, 0.5) * 0.3
+            if score > best_score:
+                best_score = score
+                best_color = (cx, cy, ccw, cch)
+
+    if best_color is None:
+        all_pts = np.vstack(color_contours)
+        best_color = cv2.boundingRect(all_pts)
+
+    cx, cy, cw_c, ch_c = best_color
+    color_center_x = cx + cw_c // 2
+    logger.info("Color region: (%d,%d) %dx%d", cx, cy, cw_c, ch_c)
+
+    # --- Phase 2: Extend VERTICALLY using edge detection ---
+    # Scan upward from color region top to find the bottle neck/cap
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 30, 100)
 
-    # Fuse: dilate edges and combine with color mask
-    edge_kernel = np.ones((9, 9), np.uint8)
-    edges_dilated = cv2.dilate(edges, edge_kernel, iterations=3)
+    # Search column: center of the bottle (where neck is)
+    search_x1 = max(0, color_center_x - cw_c // 4)
+    search_x2 = min(w, color_center_x + cw_c // 4)
 
-    # Combined mask: color OR edges (catches both oil and glass)
-    combined = cv2.bitwise_or(color_mask, edges_dilated)
+    # Scan UP from color top: find where edges disappear (= above bottle)
+    bottle_top = cy  # Start from color region top
+    min_edge_density = 0.02  # Minimum edge pixels to consider "still bottle"
 
-    # Aggressive morphology to form one solid region
-    kernel = np.ones((15, 15), np.uint8)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=6)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=2)
-
-    # Find best bottle contour
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ProcessingError("No bottle detected")
-
-    img_area = h * w
-    candidates = []
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        if cw == 0 or ch == 0:
-            continue
-        aspect = ch / cw
-        area_pct = (cw * ch) / img_area
-        center_x = (x + cw / 2) / w
-
-        if aspect > 0.8 and area_pct > 0.03:
-            score = aspect * 0.4 + (1 - abs(center_x - 0.5)) * 0.3 + min(area_pct, 0.5) * 0.3
-            candidates.append((c, x, y, cw, ch, score, aspect, area_pct))
-
-    if not candidates:
-        all_pts = np.vstack(contours)
-        x, y, cw, ch = cv2.boundingRect(all_pts)
+    for row in range(cy, 0, -3):  # Scan upward in steps of 3
+        edge_row = edges[row, search_x1:search_x2]
+        density = edge_row.sum() / (255 * max(1, search_x2 - search_x1))
+        if density < min_edge_density:
+            # No more edges → we've passed the bottle top
+            bottle_top = row + 3
+            break
     else:
-        candidates.sort(key=lambda c: c[5], reverse=True)
-        _, x, y, cw, ch, _, aspect, area_pct = candidates[0]
-        logger.info("Bottle: (%d,%d) %dx%d aspect=%.2f area=%.1f%%",
-                     x, y, cw, ch, aspect, area_pct * 100)
+        bottle_top = 0
 
-    # Expand slightly
-    pad_x = int(cw * 0.06)
-    pad_y = int(ch * 0.06)
-    x = max(0, x - pad_x)
-    y = max(0, y - pad_y)
-    cw = min(w - x, cw + 2 * pad_x)
-    ch = min(h - y, ch + 2 * pad_y)
+    # Scan DOWN from color bottom: find where edges disappear (= below bottle)
+    color_bottom = cy + ch_c
+    bottle_bottom = color_bottom
 
-    return x, y, cw, ch
+    for row in range(color_bottom, h, 3):
+        edge_row = edges[row, search_x1:search_x2]
+        density = edge_row.sum() / (255 * max(1, search_x2 - search_x1))
+        if density < min_edge_density:
+            bottle_bottom = row
+            break
+    else:
+        bottle_bottom = h
+
+    # --- Phase 3: Determine final bottle width using edges at body level ---
+    # At the body level (middle of color region), find the bottle edges
+    body_row = cy + ch_c // 2
+    edge_cols = np.where(edges[body_row] > 0)[0]
+    if len(edge_cols) > 1:
+        bottle_left = max(0, edge_cols[0] - 10)
+        bottle_right = min(w, edge_cols[-1] + 10)
+    else:
+        bottle_left = max(0, cx - int(cw_c * 0.1))
+        bottle_right = min(w, cx + cw_c + int(cw_c * 0.1))
+
+    # Final bounding box
+    bx = bottle_left
+    by = bottle_top
+    bw = bottle_right - bottle_left
+    bh = bottle_bottom - bottle_top
+
+    # Sanity checks
+    if bh < 50 or bw < 20:
+        # Fallback to color region with padding
+        bx = max(0, cx - int(cw_c * 0.1))
+        by = max(0, cy - int(ch_c * 0.3))  # Extend up 30% for neck
+        bw = min(w - bx, cw_c + int(cw_c * 0.2))
+        bh = min(h - by, ch_c + int(ch_c * 0.4))
+
+    # Small padding
+    pad = int(min(bw, bh) * 0.03)
+    bx = max(0, bx - pad)
+    by = max(0, by - pad)
+    bw = min(w - bx, bw + 2 * pad)
+    bh = min(h - by, bh + 2 * pad)
+
+    aspect = bh / max(1, bw)
+    area_pct = (bw * bh) / img_area * 100
+    logger.info("Full bottle: (%d,%d) %dx%d aspect=%.2f area=%.1f%% (extended from color top %d to %d)",
+                bx, by, bw, bh, aspect, area_pct, cy, by)
+
+    return bx, by, bw, bh
 
 
 def _crop_bottle(image):
