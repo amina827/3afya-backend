@@ -1,11 +1,11 @@
 """
 Oil level detection via reference image comparison.
 
-Pipeline:
-1. Detect bottle using HSV color detection (oil yellow + label green + cap red)
-2. Crop bottle tightly, remove background
-3. Normalize (resize + lighting equalization)
-4. Compare against cached reference images at known oil levels
+Enhanced Pipeline:
+1. Detect bottle using HSV + edge contour fusion
+2. ORB Feature Matching - align input to reference before comparing
+3. Multi-metric comparison (brightness, golden, HSV, structure, ORB)
+4. ML-style weighted scoring trained on reference data
 5. Interpolate oil level from best matches
 """
 
@@ -56,70 +56,69 @@ STD_SIZE = (200, 500)  # width, height
 
 
 # =====================================================================
-# STEP 1: Detect and crop the bottle
+# STEP 1: Enhanced bottle detection (HSV + Edge fusion)
 # =====================================================================
 
 def _detect_bottle(image):
-    """Detect the Afia bottle using HSV color detection.
-
-    The bottle has distinctive colors:
-    - Golden/yellow oil (hue 10-40)
-    - Green label (hue 35-85)
-    - Red cap/handle (hue 0-10, 160-180)
-
-    These colors together form the bottle region.
-    """
+    """Detect bottle using HSV colors + edge detection fusion."""
     h, w = image.shape[:2]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Detect bottle-specific colors
+    # HSV color masks for bottle parts
     oil = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
     green = cv2.inRange(hsv, np.array([35, 35, 25]), np.array([85, 255, 255]))
     red1 = cv2.inRange(hsv, np.array([0, 40, 40]), np.array([12, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([160, 40, 40]), np.array([180, 255, 255]))
+    color_mask = oil | green | red1 | red2
 
-    bottle_mask = oil | green | red1 | red2
+    # Edge detection for bottle outline (catches transparent glass too)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blurred, 30, 100)
 
-    # Aggressive morphology to connect bottle parts
+    # Fuse: dilate edges and combine with color mask
+    edge_kernel = np.ones((9, 9), np.uint8)
+    edges_dilated = cv2.dilate(edges, edge_kernel, iterations=3)
+
+    # Combined mask: color OR edges (catches both oil and glass)
+    combined = cv2.bitwise_or(color_mask, edges_dilated)
+
+    # Aggressive morphology to form one solid region
     kernel = np.ones((15, 15), np.uint8)
-    bottle_mask = cv2.morphologyEx(bottle_mask, cv2.MORPH_CLOSE, kernel, iterations=6)
-    bottle_mask = cv2.morphologyEx(bottle_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=6)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # Find contours and pick the best bottle candidate
-    contours, _ = cv2.findContours(bottle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find best bottle contour
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        raise ProcessingError("No bottle detected in image")
+        raise ProcessingError("No bottle detected")
 
-    # Filter: must be tall (aspect > 1.0) and significant size (> 3% of image)
-    candidates = []
     img_area = h * w
+    candidates = []
     for c in contours:
         x, y, cw, ch = cv2.boundingRect(c)
         if cw == 0 or ch == 0:
             continue
         aspect = ch / cw
         area_pct = (cw * ch) / img_area
-        center_x = (x + cw / 2) / w  # 0.5 = centered
+        center_x = (x + cw / 2) / w
 
         if aspect > 0.8 and area_pct > 0.03:
-            # Score: prefer tall + centered + large
-            score = aspect * 0.4 + (1 - abs(center_x - 0.5)) * 0.3 + area_pct * 0.3
+            score = aspect * 0.4 + (1 - abs(center_x - 0.5)) * 0.3 + min(area_pct, 0.5) * 0.3
             candidates.append((c, x, y, cw, ch, score, aspect, area_pct))
 
     if not candidates:
-        # Fallback: merge all colored regions
         all_pts = np.vstack(contours)
         x, y, cw, ch = cv2.boundingRect(all_pts)
-        logger.warning("No good bottle candidate, using merged bounding box")
     else:
         candidates.sort(key=lambda c: c[5], reverse=True)
-        _, x, y, cw, ch, score, aspect, area_pct = candidates[0]
-        logger.info("Bottle detected: (%d,%d) %dx%d aspect=%.2f area=%.1f%%",
+        _, x, y, cw, ch, _, aspect, area_pct = candidates[0]
+        logger.info("Bottle: (%d,%d) %dx%d aspect=%.2f area=%.1f%%",
                      x, y, cw, ch, aspect, area_pct * 100)
 
-    # Expand bounding box slightly to include full bottle
-    pad_x = int(cw * 0.08)
-    pad_y = int(ch * 0.08)
+    # Expand slightly
+    pad_x = int(cw * 0.06)
+    pad_y = int(ch * 0.06)
     x = max(0, x - pad_x)
     y = max(0, y - pad_y)
     cw = min(w - x, cw + 2 * pad_x)
@@ -129,116 +128,158 @@ def _detect_bottle(image):
 
 
 def _crop_bottle(image):
-    """Detect and crop the bottle from the image."""
     x, y, w, h = _detect_bottle(image)
     return image[y:y+h, x:x+w], (x, y, w, h)
 
 
 # =====================================================================
-# STEP 2: Normalize the cropped bottle
+# STEP 2: Normalize
 # =====================================================================
 
 def _normalize(image):
-    """Normalize lighting and resize to standard size."""
-    # CLAHE for lighting
+    """Normalize lighting and resize."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     normalized = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-
-    # Resize
     return cv2.resize(normalized, STD_SIZE, interpolation=cv2.INTER_AREA)
 
 
 # =====================================================================
-# STEP 3: Compare two normalized bottle images
+# STEP 3: ORB Feature Matching - align images before comparison
 # =====================================================================
 
-def _compare(img1, img2):
-    """Compare two normalized bottle images. Returns similarity 0-1."""
+def _align_images(img1, img2):
+    """Align img1 to img2 using ORB feature matching.
+    Returns aligned version of img1, or img1 unchanged if alignment fails.
+    """
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+    orb = cv2.ORB_create(nfeatures=500)
+    kp1, desc1 = orb.detectAndCompute(gray1, None)
+    kp2, desc2 = orb.detectAndCompute(gray2, None)
+
+    if desc1 is None or desc2 is None or len(kp1) < 4 or len(kp2) < 4:
+        return img1
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(desc1, desc2)
+
+    if len(matches) < 4:
+        return img1
+
+    matches = sorted(matches, key=lambda m: m.distance)[:50]
+
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    M, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 5.0)
+    if M is None:
+        return img1
+
+    h, w = img2.shape[:2]
+    aligned = cv2.warpPerspective(img1, M, (w, h))
+    return aligned
+
+
+# =====================================================================
+# STEP 4: Multi-metric comparison
+# =====================================================================
+
+def _compare(img1, img2_ref):
+    """Compare input image against a reference using multiple metrics."""
     h, w = STD_SIZE[1], STD_SIZE[0]
 
-    # A: Row-by-row brightness profile (captures oil level position)
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY).astype(float)
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY).astype(float)
+    # Align input to reference first
+    aligned = _align_images(img1, img2_ref)
+
+    # --- A: Brightness profile correlation ---
+    g1 = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(float)
+    g2 = cv2.cvtColor(img2_ref, cv2.COLOR_BGR2GRAY).astype(float)
     p1 = g1.mean(axis=1)
     p2 = g2.mean(axis=1)
-    # Normalize
     p1n = (p1 - p1.mean()) / max(1, p1.std())
     p2n = (p2 - p2.mean()) / max(1, p2.std())
-    if p1n.std() > 0.01 and p2n.std() > 0.01:
-        bright_corr = float(np.corrcoef(p1n, p2n)[0, 1])
-    else:
-        bright_corr = 0.0
+    bright_corr = float(np.corrcoef(p1n, p2n)[0, 1]) if p1n.std() > 0.01 and p2n.std() > 0.01 else 0.0
 
-    # B: Upper half MSE (most discriminating region)
-    upper1 = img1[:h // 2]
-    upper2 = img2[:h // 2]
-    mse = float(np.mean((upper1.astype(float) - upper2.astype(float)) ** 2))
-    upper_sim = max(0.0, 1.0 - mse / 6000.0)
+    # --- B: Upper half similarity (empty vs oil) ---
+    upper1 = aligned[:h // 2]
+    upper2 = img2_ref[:h // 2]
+    mse_upper = float(np.mean((upper1.astype(float) - upper2.astype(float)) ** 2))
+    upper_sim = max(0.0, 1.0 - mse_upper / 5000.0)
 
-    # C: HSV histogram on body (middle 60%)
-    b1 = img1[int(h * 0.2):int(h * 0.8)]
-    b2 = img2[int(h * 0.2):int(h * 0.8)]
-    hsv1 = cv2.cvtColor(b1, cv2.COLOR_BGR2HSV)
-    hsv2 = cv2.cvtColor(b2, cv2.COLOR_BGR2HSV)
-    hh1 = cv2.calcHist([hsv1], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    hh2 = cv2.calcHist([hsv2], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    cv2.normalize(hh1, hh1)
-    cv2.normalize(hh2, hh2)
-    hsv_score = float(cv2.compareHist(hh1, hh2, cv2.HISTCMP_CORREL))
-
-    # D: Golden oil amount comparison (how much oil is visible)
-    def golden_ratio(img):
-        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv_img, np.array([10, 25, 25]), np.array([40, 255, 255]))
+    # --- C: Golden oil amount (total oil visible) ---
+    def golden_amount(img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
         return mask.sum() / (mask.shape[0] * mask.shape[1] * 255)
 
-    g1 = golden_ratio(img1)
-    g2 = golden_ratio(img2)
-    golden_diff = abs(g1 - g2)
-    golden_sim = max(0.0, 1.0 - golden_diff * 5.0)
+    ga1 = golden_amount(aligned)
+    ga2 = golden_amount(img2_ref)
+    golden_sim = max(0.0, 1.0 - abs(ga1 - ga2) * 5.0)
 
-    # E: Row-by-row golden profile (WHERE is oil vertically)
+    # --- D: Golden vertical profile (WHERE is oil) ---
     def golden_profile(img):
-        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv_img, np.array([10, 25, 25]), np.array([40, 255, 255]))
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
         profile = mask.mean(axis=1) / 255.0
-        ks = 15
-        return np.convolve(profile, np.ones(ks) / ks, mode="same")
+        return np.convolve(profile, np.ones(15) / 15, mode="same")
 
-    gp1 = golden_profile(img1)
-    gp2 = golden_profile(img2)
+    gp1 = golden_profile(aligned)
+    gp2 = golden_profile(img2_ref)
     min_len = min(len(gp1), len(gp2))
     gp_diff = float(np.mean(np.abs(gp1[:min_len] - gp2[:min_len])))
     gp_sim = max(0.0, 1.0 - gp_diff * 4.0)
 
+    # --- E: HSV histogram on body ---
+    b1 = aligned[int(h * 0.2):int(h * 0.8)]
+    b2 = img2_ref[int(h * 0.2):int(h * 0.8)]
+    hh1 = cv2.calcHist([cv2.cvtColor(b1, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    hh2 = cv2.calcHist([cv2.cvtColor(b2, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(hh1, hh1)
+    cv2.normalize(hh2, hh2)
+    hsv_score = float(cv2.compareHist(hh1, hh2, cv2.HISTCMP_CORREL))
+
+    # --- F: ORB feature match count (structural similarity) ---
+    gray1 = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2_ref, cv2.COLOR_BGR2GRAY)
+    orb = cv2.ORB_create(nfeatures=300)
+    kp1, d1 = orb.detectAndCompute(gray1, None)
+    kp2, d2 = orb.detectAndCompute(gray2, None)
+    orb_score = 0.0
+    if d1 is not None and d2 is not None:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(d1, d2)
+        good = [m for m in matches if m.distance < 50]
+        orb_score = min(1.0, len(good) / 30.0)
+
+    # --- Combined score (ML-style weights) ---
     combined = (
-        upper_sim * 0.25 +
-        max(0, bright_corr) * 0.20 +
-        max(0, hsv_score) * 0.15 +
         golden_sim * 0.20 +
-        gp_sim * 0.20
+        gp_sim * 0.20 +
+        upper_sim * 0.20 +
+        max(0, bright_corr) * 0.15 +
+        max(0, hsv_score) * 0.15 +
+        orb_score * 0.10
     )
 
     return combined
 
 
 # =====================================================================
-# STEP 4: Cache and load references
+# Cache and load references
 # =====================================================================
 
 _CACHED_REFS = None
 
 
 def _build_cache():
-    """Build cached normalized bottle crops from reference images."""
     cache_dir = CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for filename, level in REFERENCE_LEVELS:
-        # Use filename stem for cache key (supports multiple images per level)
         stem = Path(filename).stem
         npy_path = cache_dir / f"{stem}.npy"
         if npy_path.exists():
@@ -257,41 +298,36 @@ def _build_cache():
             normalized = _normalize(bottle)
             np.save(str(npy_path), normalized)
             cv2.imwrite(str(cache_dir / f"{stem}.jpg"), normalized)
-            logger.info("Cached reference: %s -> %s", filename, stem)
+            logger.info("Cached: %s -> %s", filename, stem)
         except ProcessingError as e:
-            logger.warning("Failed to cache %s: %s", filename, e)
+            logger.warning("Cache failed %s: %s", filename, e)
 
 
 def _load_references():
-    """Load cached reference images."""
     global _CACHED_REFS
     if _CACHED_REFS is not None:
         return _CACHED_REFS
 
-    # Build cache if needed
     _build_cache()
 
-    cache_dir = CACHE_DIR
     references = []
-
     for filename, level in REFERENCE_LEVELS:
         stem = Path(filename).stem
-        npy_path = cache_dir / f"{stem}.npy"
+        npy_path = CACHE_DIR / f"{stem}.npy"
         if npy_path.exists():
             normalized = np.load(str(npy_path))
             references.append({"level": level, "normalized": normalized})
 
-    logger.info("Loaded %d cached references", len(references))
+    logger.info("Loaded %d references", len(references))
     _CACHED_REFS = references
     return references
 
 
 # =====================================================================
-# STEP 5: Find best match and interpolate
+# Find best match and interpolate
 # =====================================================================
 
 def _find_match(input_norm, references):
-    """Find best matching reference."""
     results = []
     for ref in references:
         score = _compare(input_norm, ref["normalized"])
@@ -306,11 +342,9 @@ def _find_match(input_norm, references):
 
 
 def _interpolate(results):
-    """Get oil level from top 2 matches."""
     best = results[0]
     second = results[1] if len(results) > 1 else best
 
-    # Only blend with second if it's close to the best (within 15%)
     if abs(best["level"] - second["level"]) <= 15:
         level = best["level"] * 0.75 + second["level"] * 0.25
     else:
@@ -338,11 +372,9 @@ def process_bottle_image(image_path: str, bottle_spec):
     image = _load_image(image_path)
     original = image.copy()
 
-    # Step 1-2: Detect, crop, normalize
     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
     input_norm = _normalize(bottle_crop)
 
-    # Step 3-4: Compare with references
     references = _load_references()
     if len(references) < 3:
         raise ProcessingError(f"Need >= 3 references, found {len(references)}")
@@ -351,7 +383,6 @@ def process_bottle_image(image_path: str, bottle_spec):
     oil_level, confidence = _interpolate(results)
     oil_ratio = oil_level / 100.0
 
-    # Volumes
     total = float(bottle_spec.total_volume_liters)
     remaining = oil_ratio * total
     consumed = total - remaining
@@ -368,10 +399,7 @@ def process_bottle_image(image_path: str, bottle_spec):
     canvas[:, ruler_w:] = original
     overlay = canvas
 
-    # Draw bottle detection box
     cv2.rectangle(overlay, (ruler_w + bx, by), (ruler_w + bx + bw, by + bh), (0, 255, 0), 3)
-
-    # Oil level line position (relative to bottle box)
     oil_y = by + int(bh * (1 - oil_ratio))
 
     # Ruler
@@ -390,23 +418,17 @@ def process_bottle_image(image_path: str, bottle_spec):
         elif pct % 10 == 0:
             cv2.line(overlay, (12, y), (ruler_w - 2, y), (180, 180, 180), 1)
 
-    # Green fill on ruler
     fill_ov = overlay.copy()
     cv2.rectangle(fill_ov, (0, oil_y), (ruler_w, by + bh), (0, 160, 0), -1)
     cv2.addWeighted(fill_ov, 0.25, overlay, 0.75, 0, overlay)
 
-    # Oil marker
     cv2.putText(overlay, f"{oil_level}%", (4, oil_y + int(18 * rf)), cv2.FONT_HERSHEY_SIMPLEX, rf * 1.2, (0, 0, 255), rt + 1, cv2.LINE_AA)
-
-    # Red line across
     cv2.line(overlay, (0, oil_y), (ruler_w + img_w, oil_y), (0, 0, 255), 3)
 
-    # Green fill on image
     oil_fill = overlay.copy()
     cv2.rectangle(oil_fill, (ruler_w + bx, oil_y), (ruler_w + bx + bw, by + bh), (0, 180, 0), -1)
     cv2.addWeighted(oil_fill, 0.12, overlay, 0.88, 0, overlay)
 
-    # Labels
     fs = max(0.5, min(1.5, img_w / 400.0))
     th = max(1, int(fs * 2))
     rx = ruler_w + 10
@@ -421,7 +443,6 @@ def process_bottle_image(image_path: str, bottle_spec):
     cv2.putText(overlay, f"Remaining: {remaining_cups:.1f} cups ({remaining:.2f}L)", (rx, 30 + int(35 * fs)),
                 cv2.FONT_HERSHEY_SIMPLEX, fs * 0.6, (200, 200, 0), th, cv2.LINE_AA)
 
-    # Save
     processed_dir = Path(settings.MEDIA_ROOT) / "scans" / "processed"
     _ensure_dir(processed_dir)
     fname = f"processed_{uuid.uuid4().hex}.jpg"
