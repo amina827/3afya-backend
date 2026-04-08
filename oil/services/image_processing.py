@@ -52,7 +52,10 @@ REFERENCE_LEVELS = [
     ("level_007.png", 7),    # 100ml  - 0.5 cups
 ]
 
-REFERENCE_DIR = Path(settings.MEDIA_ROOT) / "reference_levels"
+# Reference images are calibration assets that ship with the source code,
+# not user uploads. Keeping them inside the package ensures they are present
+# in every deployment (the media/ directory is gitignored and dockerignored).
+REFERENCE_DIR = Path(__file__).parent / "reference_data"
 CACHE_DIR = Path(settings.MEDIA_ROOT) / "reference_cached"
 STD_SIZE = (200, 500)  # width, height
 
