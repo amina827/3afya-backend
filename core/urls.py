@@ -25,7 +25,7 @@ schema_view = get_schema_view(
 )
 
 urlpatterns = [
-    path("healthz/", healthz, name="healthz"),
+    # path("healthz/", healthz, name="healthz"),
     path("admin/", admin.site.urls),
     path("", include("oil.urls")),
     path("api/", include("oil.api.urls")),
