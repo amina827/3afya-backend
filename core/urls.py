@@ -1,10 +1,15 @@
 from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import path, include, re_path
 from rest_framework import permissions
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
+
+
+def healthz(_request):
+    return JsonResponse({"status": "ok"})
 
 schema_view = get_schema_view(
     openapi.Info(
@@ -20,6 +25,7 @@ schema_view = get_schema_view(
 )
 
 urlpatterns = [
+    path("healthz/", healthz, name="healthz"),
     path("admin/", admin.site.urls),
     path("", include("oil.urls")),
     path("api/", include("oil.api.urls")),
