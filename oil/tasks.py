@@ -29,6 +29,7 @@ def process_scan_image(self, scan_id: str):
             scan_image.consumed_cups = result["consumed_cups"]
             scan_image.confidence_score = result["confidence_score"]
             scan_image.processing_time_ms = result["processing_time_ms"]
+            scan_image.bottle_bbox = result.get("bottle_bbox")
             scan_image.save()
 
             scan.status = ScanSession.STATUS_DONE

@@ -7,13 +7,18 @@ from PIL import Image
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-from oil.models import BottleSpecification, ScanSession, ScanImage, CupTarget
+from django.db.models import Count
+
+from oil.models import BottleSpecification, ScanSession, ScanImage, CupTarget, TrainingImage
 from oil.api.serializers import (
     ImageUploadSerializer,
     ScanResultSerializer,
     TargetLevelSerializer,
     TargetResponseSerializer,
     FeedbackSerializer,
+    TrainingImageUploadSerializer,
+    TrainingImageResponseSerializer,
+    TrainingStatsSerializer,
 )
 from oil.services.image_processing import render_target_overlay, ProcessingError
 from oil.tasks import process_scan_image
@@ -184,3 +189,75 @@ class FeedbackView(APIView):
         serializer.is_valid(raise_exception=True)
         feedback = serializer.save()
         return Response(FeedbackSerializer(feedback).data, status=status.HTTP_201_CREATED)
+
+
+class TrainingImageUploadView(APIView):
+    @swagger_auto_schema(
+        operation_id="upload_training_image",
+        operation_description="Upload a real-world bottle image for training the local detection engine. "
+                              "Include metadata about lighting, environment, and the actual oil percentage.",
+        request_body=TrainingImageUploadSerializer,
+        responses={
+            201: TrainingImageResponseSerializer,
+            400: "Bad Request.",
+            404: "Bottle not found.",
+        }
+    )
+    def post(self, request):
+        serializer = TrainingImageUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        bottle = get_object_or_404(BottleSpecification, bottle_id=serializer.validated_data["bottle_id"])
+        image = serializer.validated_data["image"]
+
+        # Validate file size
+        max_size = getattr(settings, "FILE_UPLOAD_MAX_MEMORY_SIZE", 10 * 1024 * 1024)
+        if image.size > max_size:
+            return Response({"error": "Image exceeds size limit"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            Image.open(image).verify()
+        except Exception:
+            return Response({"error": "Invalid image file"}, status=status.HTTP_400_BAD_REQUEST)
+
+        training_img = TrainingImage.objects.create(
+            bottle=bottle,
+            image=image,
+            actual_oil_percentage=serializer.validated_data["actual_oil_percentage"],
+            lighting=serializer.validated_data.get("lighting", "daylight"),
+            environment=serializer.validated_data.get("environment", "kitchen"),
+            camera_info=serializer.validated_data.get("camera_info", ""),
+            notes=serializer.validated_data.get("notes", ""),
+            uploaded_by=serializer.validated_data.get("uploaded_by", ""),
+        )
+
+        response = TrainingImageResponseSerializer(training_img, context={"request": request}).data
+        return Response(response, status=status.HTTP_201_CREATED)
+
+
+class TrainingStatsView(APIView):
+    @swagger_auto_schema(
+        operation_id="training_stats",
+        operation_description="Get statistics about collected training images.",
+        responses={200: TrainingStatsSerializer}
+    )
+    def get(self, request):
+        qs = TrainingImage.objects.all()
+        total = qs.count()
+        verified = qs.filter(is_verified=True).count()
+
+        by_lighting = dict(qs.values_list("lighting").annotate(c=Count("id")).values_list("lighting", "c"))
+        by_env = dict(qs.values_list("environment").annotate(c=Count("id")).values_list("environment", "c"))
+        by_bottle = list(
+            qs.values("bottle__bottle_id", "bottle__bottle_name")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
+
+        return Response({
+            "total_images": total,
+            "verified_images": verified,
+            "by_lighting": by_lighting,
+            "by_environment": by_env,
+            "by_bottle": by_bottle,
+        })

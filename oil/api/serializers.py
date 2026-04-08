@@ -5,6 +5,7 @@ from oil.models import (
     ScanImage,
     CupTarget,
     AccuracyFeedback,
+    TrainingImage,
 )
 
 
@@ -27,6 +28,7 @@ class ImageUploadSerializer(serializers.Serializer):
 
 class ScanResultSerializer(serializers.ModelSerializer):
     processed_image_url = serializers.SerializerMethodField()
+    original_image_url = serializers.SerializerMethodField()
     consumed_cups_range = serializers.SerializerMethodField()
     remaining_liters_estimate = serializers.SerializerMethodField()
 
@@ -42,9 +44,19 @@ class ScanResultSerializer(serializers.ModelSerializer):
             "consumed_cups_range",
             "remaining_liters_estimate",
             "processed_image_url",
+            "original_image_url",
+            "bottle_bbox",
             "confidence_score",
             "processing_time_ms",
         ]
+
+    def get_original_image_url(self, obj):
+        request = self.context.get("request")
+        if not obj.original_image:
+            return None
+        if request:
+            return request.build_absolute_uri(obj.original_image.url)
+        return obj.original_image.url
 
     def get_processed_image_url(self, obj):
         request = self.context.get("request")
@@ -95,3 +107,49 @@ class FeedbackSerializer(serializers.ModelSerializer):
         model = AccuracyFeedback
         fields = ["scan", "actual_cups", "notes", "created_at"]
         read_only_fields = ["created_at"]
+
+
+class TrainingImageUploadSerializer(serializers.Serializer):
+    bottle_id = serializers.SlugField()
+    image = serializers.ImageField()
+    actual_oil_percentage = serializers.FloatField(min_value=0, max_value=100)
+    lighting = serializers.ChoiceField(
+        choices=["daylight", "fluorescent", "dim", "direct_sun", "mixed"],
+        default="daylight",
+    )
+    environment = serializers.ChoiceField(
+        choices=["kitchen", "store", "outdoor", "office", "other"],
+        default="kitchen",
+    )
+    camera_info = serializers.CharField(required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    uploaded_by = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class TrainingImageResponseSerializer(serializers.ModelSerializer):
+    bottle_id = serializers.CharField(source="bottle.bottle_id")
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TrainingImage
+        fields = [
+            "id", "bottle_id", "image_url", "actual_oil_percentage",
+            "lighting", "environment", "camera_info", "notes",
+            "uploaded_by", "is_verified", "created_at",
+        ]
+
+    def get_image_url(self, obj):
+        request = self.context.get("request")
+        if not obj.image:
+            return None
+        if request:
+            return request.build_absolute_uri(obj.image.url)
+        return obj.image.url
+
+
+class TrainingStatsSerializer(serializers.Serializer):
+    total_images = serializers.IntegerField()
+    verified_images = serializers.IntegerField()
+    by_lighting = serializers.DictField()
+    by_environment = serializers.DictField()
+    by_bottle = serializers.ListField()

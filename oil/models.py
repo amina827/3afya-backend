@@ -84,6 +84,11 @@ class ScanImage(models.Model):
     consumed_cups = models.FloatField(null=True, blank=True)
     confidence_score = models.FloatField(null=True, blank=True)
     processing_time_ms = models.PositiveIntegerField(null=True, blank=True)
+    bottle_bbox = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Bottle bounding box: {x, y, w, h, image_w, image_h}",
+    )
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -100,3 +105,35 @@ class AccuracyFeedback(models.Model):
     actual_cups = models.FloatField()
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class TrainingImage(models.Model):
+    """Real-world images collected to improve the local programmatic engine."""
+    LIGHTING_CHOICES = [
+        ("daylight", "Natural Daylight"),
+        ("fluorescent", "Fluorescent/Indoor"),
+        ("dim", "Dim/Low Light"),
+        ("direct_sun", "Direct Sunlight"),
+        ("mixed", "Mixed Lighting"),
+    ]
+    ENV_CHOICES = [
+        ("kitchen", "Kitchen"),
+        ("store", "Store/Shelf"),
+        ("outdoor", "Outdoor"),
+        ("office", "Office"),
+        ("other", "Other"),
+    ]
+
+    bottle = models.ForeignKey(BottleSpecification, on_delete=models.CASCADE, related_name="training_images")
+    image = models.ImageField(upload_to="training/")
+    actual_oil_percentage = models.FloatField(help_text="Actual oil level 0-100 as reported by the tester")
+    lighting = models.CharField(max_length=32, choices=LIGHTING_CHOICES, default="daylight")
+    environment = models.CharField(max_length=32, choices=ENV_CHOICES, default="kitchen")
+    camera_info = models.CharField(max_length=255, blank=True)
+    notes = models.TextField(blank=True)
+    uploaded_by = models.CharField(max_length=120, blank=True, help_text="Tester name or ID")
+    is_verified = models.BooleanField(default=False, help_text="Verified by admin for use in training")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Training {self.bottle.bottle_id} {self.actual_oil_percentage}% ({self.lighting}/{self.environment})"

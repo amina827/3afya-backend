@@ -40,14 +40,16 @@ def _ensure_dir(path: Path):
 # Reference data
 # =====================================================================
 
+# Calibrated 1.5L Afia bottle references (200ml per cup, 7.5 cups total)
 REFERENCE_LEVELS = [
-    ("level_100.jpg", 100), ("level_095.jpg", 95), ("level_090.jpg", 90),
-    ("level_086.jpg", 86), ("level_081.jpg", 81), ("level_076.jpg", 76),
-    ("level_071.jpg", 71), ("level_067.jpg", 67), ("level_062.jpg", 62),
-    ("level_057.jpg", 57), ("level_052.jpg", 52), ("level_048.jpg", 48),
-    ("level_043.jpg", 43), ("level_038.jpg", 38), ("level_033.jpg", 33),
-    ("level_029.jpg", 29), ("level_024.jpg", 24), ("level_019.jpg", 19),
-    ("level_014.jpg", 14), ("level_010.jpg", 10), ("level_010b.jpg", 10),
+    ("level_100.png", 100),  # 1500ml - full
+    ("level_087.png", 87),   # 1300ml - 6.5 cups
+    ("level_073.png", 73),   # 1100ml - 5.5 cups
+    ("level_060.png", 60),   # 900ml  - 4.5 cups
+    ("level_047.png", 47),   # 700ml  - 3.5 cups
+    ("level_033.png", 33),   # 500ml  - 2.5 cups
+    ("level_020.png", 20),   # 300ml  - 1.5 cups
+    ("level_007.png", 7),    # 100ml  - 0.5 cups
 ]
 
 REFERENCE_DIR = Path(settings.MEDIA_ROOT) / "reference_levels"
@@ -59,133 +61,111 @@ STD_SIZE = (200, 500)  # width, height
 # STEP 1: Enhanced bottle detection (HSV + Edge fusion)
 # =====================================================================
 
+# Calibrated bottle aspect ratio (height / width) for the Afia 1.5L bottle.
+# Measured from reference images: bottle bbox 133x248 in 286x329 image,
+# aspect = 248/133 = 1.864. NECK to BASE, including handle.
+BOTTLE_ASPECT = 1.88
+
+# Color region tends to extend slightly BELOW the bottle base due to
+# shadows / reflections. Subtract this fraction of bottle_height.
+COLOR_BOTTOM_OFFSET = -0.025
+
+
+def _adaptive_inflation(color_aspect: float) -> float:
+    """How much wider is the bottle than the detected color region?
+
+    Calibrated against 8 reference images:
+    - HIGH fill (color aspect ~2.2): color ≈ bottle, use 1.05
+    - MED fill (color aspect ~1.0): color slightly narrower, use 1.07
+    - LOW fill (color aspect ~0.5): only label visible, use 1.13
+    - VERY LOW (color aspect < 0.4): tiny label region, use 1.25
+    """
+    if color_aspect >= 1.5:
+        return 1.05
+    if color_aspect >= 0.8:
+        # 0.8 → 1.10, 1.5 → 1.05
+        return 1.10 - (color_aspect - 0.8) / 0.7 * 0.05
+    if color_aspect >= 0.4:
+        # 0.4 → 1.20, 0.8 → 1.10
+        return 1.20 - (color_aspect - 0.4) / 0.4 * 0.10
+    return 1.25
+
+
 def _detect_bottle(image):
-    """Detect the FULL bottle including transparent glass neck.
+    """Detect the bottle bounding box using calibrated proportions.
 
     Strategy:
-    1. HSV colors detect oil + label + cap (colored parts)
-    2. Edge detection finds the transparent glass outline (neck, body)
-    3. Extend vertically: scan UP from color region using edges to find bottle top
-    4. Extend vertically: scan DOWN to find bottle base
-    5. Result: full bottle from cap to base
+    1. Build a color mask (yellow oil + green/red label parts).
+    2. Find the largest coherent color region.
+    3. Compute bottle WIDTH from color width with adaptive inflation.
+    4. Compute bottle HEIGHT from calibrated aspect ratio.
+    5. Anchor the BOTTOM to the color region bottom (minus small spillage).
     """
     h, w = image.shape[:2]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # --- Phase 1: Find colored region (oil + label + cap) ---
-    oil = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
-    green = cv2.inRange(hsv, np.array([35, 35, 25]), np.array([85, 255, 255]))
-    red1 = cv2.inRange(hsv, np.array([0, 40, 40]), np.array([12, 255, 255]))
-    red2 = cv2.inRange(hsv, np.array([160, 40, 40]), np.array([180, 255, 255]))
-    color_mask = oil | green | red1 | red2
+    # --- Phase 1: Detect bottle colors ---
+    yellow = cv2.inRange(hsv, np.array([10, 55, 70]), np.array([40, 255, 255]))
+    green = cv2.inRange(hsv, np.array([40, 55, 45]), np.array([90, 255, 255]))
+    red1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([10, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([165, 70, 60]), np.array([180, 255, 255]))
+    color_mask = yellow | green | red1 | red2
 
-    kernel = np.ones((15, 15), np.uint8)
-    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=4)
-    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    kernel = np.ones((9, 9), np.uint8)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
 
-    # Get bounding box of colored region
-    color_contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not color_contours:
+    # --- Phase 2: Find largest coherent contour ---
+    contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         raise ProcessingError("No bottle colors detected")
 
-    # Pick best color contour (tall + centered)
-    img_area = h * w
-    best_color = None
-    best_score = -1
-    for c in color_contours:
-        cx, cy, ccw, cch = cv2.boundingRect(c)
-        if ccw == 0 or cch == 0:
-            continue
-        aspect = cch / ccw
-        area_pct = (ccw * cch) / img_area
-        center = (cx + ccw / 2) / w
-        if area_pct > 0.02:
-            score = aspect * 0.4 + (1 - abs(center - 0.5)) * 0.3 + min(area_pct, 0.5) * 0.3
-            if score > best_score:
-                best_score = score
-                best_color = (cx, cy, ccw, cch)
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    if area < 300:
+        raise ProcessingError(f"Color region too small: area={area:.0f}")
 
-    if best_color is None:
-        all_pts = np.vstack(color_contours)
-        best_color = cv2.boundingRect(all_pts)
+    cx, cy, cw, ch = cv2.boundingRect(largest)
+    color_aspect = ch / max(1, cw)
+    color_bottom = cy + ch
+    color_center_x = cx + cw // 2
 
-    cx, cy, cw_c, ch_c = best_color
-    color_center_x = cx + cw_c // 2
-    logger.info("Color region: (%d,%d) %dx%d", cx, cy, cw_c, ch_c)
+    logger.info("Color region: (%d,%d) %dx%d aspect=%.2f area=%.0f",
+                cx, cy, cw, ch, color_aspect, area)
 
-    # --- Phase 2: Extend VERTICALLY using edge detection ---
-    # Scan upward from color region top to find the bottle neck/cap
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 30, 100)
+    # --- Phase 3: Compute bottle dimensions from calibrated proportions ---
+    # Width comes from color region with adaptive inflation (depends on fill).
+    # Height comes from calibrated aspect ratio.
+    # We trust the WIDTH estimate more than the height - color heights are noisy
+    # because they reflect oil level (which varies), but color widths reflect
+    # the label/body width (which is constant).
+    inflation = _adaptive_inflation(color_aspect)
+    bottle_width = int(round(cw * inflation))
+    bottle_height = int(round(bottle_width * BOTTLE_ASPECT))
 
-    # Search column: center of the bottle (where neck is)
-    search_x1 = max(0, color_center_x - cw_c // 4)
-    search_x2 = min(w, color_center_x + cw_c // 4)
+    # --- Phase 4: Position the bbox ---
+    # Bottom: anchored to color region bottom (minus a small offset since
+    # color often has a few pixels of bleed below the base)
+    spillage = int(round(bottle_height * abs(COLOR_BOTTOM_OFFSET)))
+    bottle_bottom = min(h, color_bottom - spillage)
+    bottle_top = max(0, bottle_bottom - bottle_height)
 
-    # Scan UP from color top: find where edges disappear (= above bottle)
-    bottle_top = cy  # Start from color region top
-    min_edge_density = 0.02  # Minimum edge pixels to consider "still bottle"
+    # Sides: centered on color centroid horizontally
+    bottle_left = max(0, color_center_x - bottle_width // 2)
+    bottle_right = min(w, bottle_left + bottle_width)
+    bottle_left = max(0, bottle_right - bottle_width)  # adjust if right clipped
 
-    for row in range(cy, 0, -3):  # Scan upward in steps of 3
-        edge_row = edges[row, search_x1:search_x2]
-        density = edge_row.sum() / (255 * max(1, search_x2 - search_x1))
-        if density < min_edge_density:
-            # No more edges → we've passed the bottle top
-            bottle_top = row + 3
-            break
-    else:
-        bottle_top = 0
-
-    # Scan DOWN from color bottom: find where edges disappear (= below bottle)
-    color_bottom = cy + ch_c
-    bottle_bottom = color_bottom
-
-    for row in range(color_bottom, h, 3):
-        edge_row = edges[row, search_x1:search_x2]
-        density = edge_row.sum() / (255 * max(1, search_x2 - search_x1))
-        if density < min_edge_density:
-            bottle_bottom = row
-            break
-    else:
-        bottle_bottom = h
-
-    # --- Phase 3: Determine final bottle width using edges at body level ---
-    # At the body level (middle of color region), find the bottle edges
-    body_row = cy + ch_c // 2
-    edge_cols = np.where(edges[body_row] > 0)[0]
-    if len(edge_cols) > 1:
-        bottle_left = max(0, edge_cols[0] - 10)
-        bottle_right = min(w, edge_cols[-1] + 10)
-    else:
-        bottle_left = max(0, cx - int(cw_c * 0.1))
-        bottle_right = min(w, cx + cw_c + int(cw_c * 0.1))
-
-    # Final bounding box
     bx = bottle_left
     by = bottle_top
     bw = bottle_right - bottle_left
     bh = bottle_bottom - bottle_top
 
-    # Sanity checks
     if bh < 50 or bw < 20:
-        # Fallback to color region with padding
-        bx = max(0, cx - int(cw_c * 0.1))
-        by = max(0, cy - int(ch_c * 0.3))  # Extend up 30% for neck
-        bw = min(w - bx, cw_c + int(cw_c * 0.2))
-        bh = min(h - by, ch_c + int(ch_c * 0.4))
+        raise ProcessingError(f"Detected bottle too small: {bw}x{bh}")
 
-    # Small padding
-    pad = int(min(bw, bh) * 0.03)
-    bx = max(0, bx - pad)
-    by = max(0, by - pad)
-    bw = min(w - bx, bw + 2 * pad)
-    bh = min(h - by, bh + 2 * pad)
-
-    aspect = bh / max(1, bw)
-    area_pct = (bw * bh) / img_area * 100
-    logger.info("Full bottle: (%d,%d) %dx%d aspect=%.2f area=%.1f%% (extended from color top %d to %d)",
-                bx, by, bw, bh, aspect, area_pct, cy, by)
+    final_aspect = bh / max(1, bw)
+    logger.info("Bottle bbox: (%d,%d) %dx%d aspect=%.2f inflation=%.2f",
+                bx, by, bw, bh, final_aspect, inflation)
 
     return bx, by, bw, bh
 
@@ -455,56 +435,30 @@ def process_bottle_image(image_path: str, bottle_spec):
 
     logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
 
-    # ---- OVERLAY ----
+    # ---- MINIMAL OVERLAY: Just the red oil line + percentage label ----
     img_h, img_w = original.shape[:2]
-    ruler_w = max(70, int(img_w * 0.10))
-    canvas = np.ones((img_h, img_w + ruler_w, 3), dtype=np.uint8) * 35
-    canvas[:, ruler_w:] = original
-    overlay = canvas
+    overlay = original.copy()
 
-    cv2.rectangle(overlay, (ruler_w + bx, by), (ruler_w + bx + bw, by + bh), (0, 255, 0), 3)
     oil_y = by + int(bh * (1 - oil_ratio))
 
-    # Ruler
-    cv2.rectangle(overlay, (0, by), (ruler_w, by + bh), (30, 30, 30), -1)
-    rf = max(0.35, min(0.55, ruler_w / 100.0))
-    rt = max(1, int(rf * 2))
+    # Red oil level line across the entire image
+    cv2.line(overlay, (0, oil_y), (img_w, oil_y), (0, 0, 255), 3)
 
-    cv2.putText(overlay, "FULL", (2, by - 5), cv2.FONT_HERSHEY_SIMPLEX, rf * 0.8, (0, 200, 0), 1, cv2.LINE_AA)
-    cv2.putText(overlay, "EMPTY", (2, by + bh + int(15 * rf * 2)), cv2.FONT_HERSHEY_SIMPLEX, rf * 0.8, (0, 0, 200), 1, cv2.LINE_AA)
+    # Oil percentage label above the line
+    fs = max(0.6, min(1.6, img_w / 400.0))
+    th = max(2, int(fs * 2))
+    label = f"{oil_level}%"
+    (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
 
-    for pct in range(0, 101, 5):
-        y = by + bh - int(bh * pct / 100)
-        if pct % 20 == 0:
-            cv2.line(overlay, (2, y), (ruler_w - 2, y), (255, 255, 255), 2)
-            cv2.putText(overlay, f"{pct}%", (4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, rf, (255, 255, 255), rt, cv2.LINE_AA)
-        elif pct % 10 == 0:
-            cv2.line(overlay, (12, y), (ruler_w - 2, y), (180, 180, 180), 1)
+    # Position label centered horizontally on the bottle, above the line
+    label_x = max(10, min(img_w - tw - 10, bx + bw // 2 - tw // 2))
+    label_y = max(th_text + 10, oil_y - 10)
 
-    fill_ov = overlay.copy()
-    cv2.rectangle(fill_ov, (0, oil_y), (ruler_w, by + bh), (0, 160, 0), -1)
-    cv2.addWeighted(fill_ov, 0.25, overlay, 0.75, 0, overlay)
-
-    cv2.putText(overlay, f"{oil_level}%", (4, oil_y + int(18 * rf)), cv2.FONT_HERSHEY_SIMPLEX, rf * 1.2, (0, 0, 255), rt + 1, cv2.LINE_AA)
-    cv2.line(overlay, (0, oil_y), (ruler_w + img_w, oil_y), (0, 0, 255), 3)
-
-    oil_fill = overlay.copy()
-    cv2.rectangle(oil_fill, (ruler_w + bx, oil_y), (ruler_w + bx + bw, by + bh), (0, 180, 0), -1)
-    cv2.addWeighted(oil_fill, 0.12, overlay, 0.88, 0, overlay)
-
-    fs = max(0.5, min(1.5, img_w / 400.0))
-    th = max(1, int(fs * 2))
-    rx = ruler_w + 10
-
-    cv2.putText(overlay, f"Oil: {oil_level}% ({remaining:.2f}L)", (rx, max(25, oil_y - 15)),
+    # White outline for readability
+    cv2.putText(overlay, label, (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th + 3, cv2.LINE_AA)
+    cv2.putText(overlay, label, (label_x, label_y),
                 cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), th, cv2.LINE_AA)
-
-    badge_col = (0, 200, 0) if confidence >= 0.75 else (0, 180, 255) if confidence >= 0.55 else (0, 0, 255)
-    badge_txt = "HIGH" if confidence >= 0.75 else "MED" if confidence >= 0.55 else "LOW"
-    cv2.putText(overlay, f"Confidence: {confidence:.0%} ({badge_txt})", (rx, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, fs * 0.7, badge_col, th, cv2.LINE_AA)
-    cv2.putText(overlay, f"Remaining: {remaining_cups:.1f} cups ({remaining:.2f}L)", (rx, 30 + int(35 * fs)),
-                cv2.FONT_HERSHEY_SIMPLEX, fs * 0.6, (200, 200, 0), th, cv2.LINE_AA)
 
     processed_dir = Path(settings.MEDIA_ROOT) / "scans" / "processed"
     _ensure_dir(processed_dir)
@@ -525,6 +479,14 @@ def process_bottle_image(image_path: str, bottle_spec):
         "consumed_cups": consumed_cups,
         "confidence_score": round(confidence, 2),
         "processing_time_ms": processing_time_ms,
+        "bottle_bbox": {
+            "x": int(bx),
+            "y": int(by),
+            "w": int(bw),
+            "h": int(bh),
+            "image_w": int(img_w),
+            "image_h": int(img_h),
+        },
     }
 
 
