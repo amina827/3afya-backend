@@ -34,5 +34,11 @@ urlpatterns = [
     path("redoc/", schema_view.with_ui("redoc", cache_timeout=0), name="schema-redoc"),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Always serve /media/ — Django's default static() helper only registers
+# this in DEBUG mode. WhiteNoise handles /static/ but not /media/, so we
+# wire up Django's serve view directly. Fine for this scale; for higher
+# volume move uploads to object storage (S3/R2/Railway Volume).
+from django.views.static import serve as media_serve  # noqa: E402
+urlpatterns += [
+    re_path(r"^media/(?P<path>.*)$", media_serve, {"document_root": settings.MEDIA_ROOT}),
+]
