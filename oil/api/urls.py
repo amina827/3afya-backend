@@ -1,7 +1,7 @@
 from django.urls import path
 from oil.api.views import (
     ImageUploadView, ScanResultView, TargetLevelView, FeedbackView,
-    TrainingImageUploadView, TrainingStatsView,
+    TrainingImageUploadView, TrainingStatsView, VerifyQRView,
 )
 
 urlpatterns = [
@@ -11,4 +11,5 @@ urlpatterns = [
     path("feedback/", FeedbackView.as_view(), name="feedback"),
     path("training/upload/", TrainingImageUploadView.as_view(), name="training-upload"),
     path("training/stats/", TrainingStatsView.as_view(), name="training-stats"),
+    path("verify-qr/", VerifyQRView.as_view(), name="verify-qr"),
 ]

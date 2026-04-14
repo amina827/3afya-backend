@@ -6,6 +6,9 @@ from oil.models import (
     CupTarget,
     AccuracyFeedback,
     TrainingImage,
+    Label,
+    QRCode,
+    VerificationLog,
 )
 
 
@@ -153,3 +156,58 @@ class TrainingStatsSerializer(serializers.Serializer):
     by_lighting = serializers.DictField()
     by_environment = serializers.DictField()
     by_bottle = serializers.ListField()
+
+
+# =====================================================================
+# QR Code & Label Verification
+# =====================================================================
+
+class LabelSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Label
+        fields = [
+            "id", "name", "name_en", "product_type", "volume_ml",
+            "barcode", "image_url", "description", "is_active",
+        ]
+
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(obj.image.url)
+        return obj.image.url
+
+
+class QRCodeSerializer(serializers.ModelSerializer):
+    label = LabelSerializer(read_only=True)
+
+    class Meta:
+        model = QRCode
+        fields = [
+            "id", "code", "label", "batch_number",
+            "production_date", "expiry_date", "factory_code", "is_active",
+        ]
+
+
+class VerifyQRSerializer(serializers.Serializer):
+    """Input for QR vs Label verification."""
+    qr_data = serializers.CharField(help_text="The scanned QR code content")
+    scanned_label_name = serializers.CharField(
+        required=False, allow_blank=True,
+        help_text="What label the user sees on the bottle (optional)",
+    )
+    bottle_image = serializers.ImageField(
+        required=False,
+        help_text="Photo of the bottle for verification (optional)",
+    )
+
+
+class VerifyResultSerializer(serializers.Serializer):
+    """Output of QR vs Label verification."""
+    result = serializers.ChoiceField(choices=VerificationLog.RESULT_CHOICES)
+    message = serializers.CharField()
+    qr_code = QRCodeSerializer(allow_null=True)
+    expected_label = LabelSerializer(allow_null=True)

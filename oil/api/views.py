@@ -9,7 +9,7 @@ from drf_yasg import openapi
 
 from django.db.models import Count
 
-from oil.models import BottleSpecification, ScanSession, ScanImage, CupTarget, TrainingImage
+from oil.models import BottleSpecification, ScanSession, ScanImage, CupTarget, TrainingImage, QRCode, VerificationLog
 from oil.api.serializers import (
     ImageUploadSerializer,
     ScanResultSerializer,
@@ -19,6 +19,8 @@ from oil.api.serializers import (
     TrainingImageUploadSerializer,
     TrainingImageResponseSerializer,
     TrainingStatsSerializer,
+    VerifyQRSerializer,
+    VerifyResultSerializer,
 )
 from oil.services.image_processing import render_target_overlay, ProcessingError
 from oil.tasks import process_scan_image
@@ -261,3 +263,102 @@ class TrainingStatsView(APIView):
             "by_environment": by_env,
             "by_bottle": by_bottle,
         })
+
+
+# =====================================================================
+# QR Code & Label Verification
+# =====================================================================
+
+class VerifyQRView(APIView):
+    @swagger_auto_schema(
+        operation_id="verify_qr_label",
+        operation_description=(
+            "Verify that a scanned QR code matches the expected bottle label. "
+            "Returns match/mismatch/not_found with label details."
+        ),
+        request_body=VerifyQRSerializer,
+        responses={
+            200: VerifyResultSerializer,
+            400: "Invalid input",
+        },
+    )
+    def post(self, request):
+        serializer = VerifyQRSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        qr_data = serializer.validated_data["qr_data"].strip()
+        scanned_label_name = serializer.validated_data.get("scanned_label_name", "")
+        bottle_image = serializer.validated_data.get("bottle_image")
+
+        # Look up the QR code in the database
+        try:
+            qr_entry = QRCode.objects.select_related("label").get(code=qr_data, is_active=True)
+        except QRCode.DoesNotExist:
+            # QR not found in database
+            VerificationLog.objects.create(
+                qr_data=qr_data,
+                scanned_label_name=scanned_label_name,
+                result=VerificationLog.RESULT_QR_NOT_FOUND,
+                bottle_image=bottle_image or "",
+            )
+            return Response(
+                VerifyResultSerializer({
+                    "result": "qr_not_found",
+                    "message": "QR code not found in database. This may not be a genuine product.",
+                    "qr_code": None,
+                    "expected_label": None,
+                }).data,
+                status=status.HTTP_200_OK,
+            )
+
+        # QR found - increment scan count
+        qr_entry.scan_count += 1
+        qr_entry.save(update_fields=["scan_count"])
+
+        expected_label = qr_entry.label
+
+        # Check if scanned label matches expected label
+        if scanned_label_name:
+            # Simple name matching (case-insensitive, partial match)
+            name_lower = scanned_label_name.lower()
+            label_names = [
+                expected_label.name.lower(),
+                expected_label.name_en.lower(),
+                expected_label.product_type.lower(),
+            ]
+            is_match = any(
+                name_lower in ln or ln in name_lower
+                for ln in label_names if ln
+            )
+            result_type = VerificationLog.RESULT_MATCH if is_match else VerificationLog.RESULT_MISMATCH
+        else:
+            # No label name to compare - return the expected label info
+            result_type = VerificationLog.RESULT_MATCH
+
+        # Log the verification
+        VerificationLog.objects.create(
+            qr_data=qr_data,
+            qr_code=qr_entry,
+            expected_label=expected_label,
+            scanned_label_name=scanned_label_name,
+            result=result_type,
+            bottle_image=bottle_image or "",
+        )
+
+        if result_type == VerificationLog.RESULT_MATCH:
+            message = f"QR code matches: {expected_label.name}"
+        else:
+            message = (
+                f"MISMATCH! QR code belongs to '{expected_label.name}' "
+                f"but label shows '{scanned_label_name}'"
+            )
+
+        return Response(
+            VerifyResultSerializer({
+                "result": result_type,
+                "message": message,
+                "qr_code": qr_entry,
+                "expected_label": expected_label,
+            }, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )

@@ -7,6 +7,9 @@ from .models import (
     CupTarget,
     AccuracyFeedback,
     TrainingImage,
+    Label,
+    QRCode,
+    VerificationLog,
 )
 
 
@@ -55,6 +58,57 @@ class CupTargetAdmin(admin.ModelAdmin):
 @admin.register(AccuracyFeedback)
 class AccuracyFeedbackAdmin(admin.ModelAdmin):
     list_display = ("scan", "actual_cups", "created_at")
+
+
+# =====================================================================
+# QR Code & Label Admin
+# =====================================================================
+
+class QRCodeInline(admin.TabularInline):
+    model = QRCode
+    extra = 1
+    fields = ("code", "batch_number", "production_date", "expiry_date", "factory_code", "is_active", "scan_count")
+    readonly_fields = ("scan_count",)
+
+
+@admin.register(Label)
+class LabelAdmin(admin.ModelAdmin):
+    list_display = ("name", "product_type", "volume_ml", "bottle", "barcode", "is_active", "qr_count")
+    list_filter = ("product_type", "is_active", "volume_ml")
+    search_fields = ("name", "name_en", "barcode")
+    list_editable = ("is_active",)
+    inlines = [QRCodeInline]
+
+    @admin.display(description="QR Codes")
+    def qr_count(self, obj):
+        return obj.qr_codes.count()
+
+
+@admin.register(QRCode)
+class QRCodeAdmin(admin.ModelAdmin):
+    list_display = ("short_code", "label", "batch_number", "production_date", "expiry_date", "is_active", "scan_count")
+    list_filter = ("is_active", "label__product_type", "production_date")
+    search_fields = ("code", "batch_number", "factory_code", "label__name")
+    list_editable = ("is_active",)
+    readonly_fields = ("scan_count",)
+    raw_id_fields = ("label",)
+
+    @admin.display(description="QR Code")
+    def short_code(self, obj):
+        return obj.code[:60] + "..." if len(obj.code) > 60 else obj.code
+
+
+@admin.register(VerificationLog)
+class VerificationLogAdmin(admin.ModelAdmin):
+    list_display = ("result", "qr_data_short", "expected_label", "scanned_label_name", "created_at")
+    list_filter = ("result", "created_at")
+    search_fields = ("qr_data", "scanned_label_name")
+    readonly_fields = ("qr_data", "qr_code", "expected_label", "result", "bottle_image", "device_info", "created_at")
+    date_hierarchy = "created_at"
+
+    @admin.display(description="QR Data")
+    def qr_data_short(self, obj):
+        return obj.qr_data[:40] + "..." if len(obj.qr_data) > 40 else obj.qr_data
 
 
 @admin.register(TrainingImage)
