@@ -179,6 +179,140 @@ def _crop_bottle(image):
 
 
 # =====================================================================
+# STEP 1.5: Smart ROI + Adaptive HSV
+# =====================================================================
+
+def _body_roi(bottle_img, vertical=(0.05, 0.97), horizontal=(0.15, 0.85)):
+    """Restrict processing to the bottle BODY (skip cap & handle edges).
+
+    Defaults exclude cap area (top 5%) and narrow sides (handle bleed).
+    Kept loose vertically because the oil line itself may sit anywhere
+    from near the top to near the base.
+    """
+    h, w = bottle_img.shape[:2]
+    y1, y2 = int(h * vertical[0]), int(h * vertical[1])
+    x1, x2 = int(w * horizontal[0]), int(w * horizontal[1])
+    return bottle_img[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1)
+
+
+def _adaptive_oil_mask(img_bgr):
+    """Build an HSV mask for oil that adapts to the image's own color cast.
+
+    Falls back to the calibrated static range when the adaptive window
+    would shift outside the plausible golden/yellow band [5, 45].
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Sample only somewhat-saturated pixels to avoid a hue mean dragged
+    # down by the white/grey background.
+    sat_mask = hsv[:, :, 1] > 40
+    if sat_mask.sum() > 500:
+        h_vals = hsv[:, :, 0][sat_mask]
+        h_median = float(np.median(h_vals))
+    else:
+        h_median = 25.0  # fall back to oil band center
+
+    # Clamp into the plausible oil band to stay safe against outliers.
+    h_center = max(10.0, min(35.0, h_median))
+    lower = np.array([max(0, h_center - 12), 35, 35], dtype=np.uint8)
+    upper = np.array([min(179, h_center + 15), 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+
+    # Union with calibrated static mask so we never lose obvious oil.
+    static = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
+    return mask | static
+
+
+# =====================================================================
+# STEP 1.6: Direct oil-line detection (Canny + Hough)
+# =====================================================================
+
+def _detect_oil_line_direct(bottle_crop):
+    """Detect the oil meniscus directly on the bottle crop.
+
+    Returns (y_relative, confidence) where y_relative is the oil-line Y
+    position as a fraction of the bottle HEIGHT (0.0 top, 1.0 bottom),
+    or (None, 0.0) if no convincing line is found.
+
+    Strategy:
+    1. Restrict to body ROI (avoid cap / handle edges).
+    2. Canny edges + HoughLinesP to collect near-horizontal segments.
+    3. Score each candidate by the brightness step across it
+       (oil-to-air transition produces a strong delta).
+    4. Return the best scoring line's Y (remapped to full-bottle coords).
+    """
+    bh_full = bottle_crop.shape[0]
+    if bh_full < 80:
+        return None, 0.0
+
+    roi, (rx, ry, rw, rh) = _body_roi(
+        bottle_crop, vertical=(0.02, 0.98), horizontal=(0.20, 0.80)
+    )
+    if rh < 50 or rw < 20:
+        return None, 0.0
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 40, 130)
+
+    min_len = max(20, int(rw * 0.35))
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=max(30, int(rw * 0.25)),
+        minLineLength=min_len,
+        maxLineGap=10,
+    )
+    if lines is None:
+        return None, 0.0
+
+    # Collect near-horizontal segments and aggregate by Y.
+    band_h = 6  # group segments within ±6 pixels
+    buckets = {}
+    for seg in lines:
+        x1, y1, x2, y2 = seg[0]
+        if abs(y1 - y2) > 3:
+            continue
+        y_mid = (y1 + y2) // 2
+        length = abs(x2 - x1)
+        key = y_mid // band_h
+        buckets.setdefault(key, []).append((y_mid, length))
+
+    if not buckets:
+        return None, 0.0
+
+    # Score each bucket by brightness delta (oil darker than air above it).
+    best = None
+    for key, segs in buckets.items():
+        y_mid = int(np.mean([s[0] for s in segs]))
+        total_len = sum(s[1] for s in segs)
+        if total_len < rw * 0.4:
+            continue
+
+        up1, up2 = max(0, y_mid - 12), max(0, y_mid - 2)
+        dn1, dn2 = min(rh, y_mid + 2), min(rh, y_mid + 12)
+        if up2 <= up1 or dn2 <= dn1:
+            continue
+        above = float(gray[up1:up2].mean())
+        below = float(gray[dn1:dn2].mean())
+        delta = below - above  # positive = darker above (empty) / brighter below (oil)
+        # Oil is golden/yellow → brighter than empty air in LAB L but darker in
+        # some scenes. Use absolute delta as the signal.
+        score = abs(delta) * (total_len / rw)
+
+        if best is None or score > best["score"]:
+            best = {"y": y_mid, "score": score, "delta": delta, "len": total_len}
+
+    if best is None or best["score"] < 8.0:
+        return None, 0.0
+
+    # Remap Y from ROI coords to full bottle crop coords.
+    y_full = ry + best["y"]
+    y_relative = y_full / bh_full
+    # Confidence scales with score; cap at 0.85 — edges alone are noisy.
+    conf = min(0.85, 0.35 + best["score"] / 80.0)
+    return float(y_relative), float(conf)
+
+
+# =====================================================================
 # STEP 2: Normalize
 # =====================================================================
 
@@ -234,12 +368,88 @@ def _align_images(img1, img2):
 # STEP 4: Multi-metric comparison
 # =====================================================================
 
+_BASE_WEIGHTS = {
+    "golden_sim": 0.20,
+    "gp_sim": 0.20,
+    "upper_sim": 0.20,
+    "bright_corr": 0.15,
+    "hsv_score": 0.15,
+    "orb_score": 0.10,
+}
+
+
+def _dynamic_weights(metrics, img_stats):
+    """Adjust weights based on scene quality signals.
+
+    - Bad lighting (very low / very high mean V) → trust brightness less.
+    - Poor ORB alignment (few matches) → trust orb_score less and lean
+      on color/profile metrics.
+    - Very low saturation across the scene → trust golden metrics less.
+    """
+    w = dict(_BASE_WEIGHTS)
+
+    mean_v = img_stats.get("mean_v", 128)
+    mean_s = img_stats.get("mean_s", 100)
+    orb_raw = metrics.get("orb_raw_matches", 0)
+
+    if mean_v < 55 or mean_v > 215:
+        # Washed out or very dark – brightness profile is unreliable.
+        w["bright_corr"] *= 0.5
+        w["upper_sim"] *= 0.7
+    if orb_raw < 8:
+        # Alignment and structural match are unreliable; shift to color.
+        w["orb_score"] *= 0.3
+        w["golden_sim"] *= 1.15
+        w["gp_sim"] *= 1.15
+    if mean_s < 35:
+        # Desaturated scene — color-based metrics weaker.
+        w["golden_sim"] *= 0.7
+        w["hsv_score"] *= 0.7
+
+    # Renormalize to keep the combined score in [0, 1].
+    total = sum(w.values()) or 1.0
+    return {k: v / total for k, v in w.items()}
+
+
+def _reject_outliers(metrics):
+    """Zero-out a metric whose value is an extreme outlier vs its peers.
+
+    Only triggers when the offender is clearly worse than the others —
+    protects against a single noisy signal dragging the combined score.
+    """
+    vals = {k: max(0.0, float(v)) for k, v in metrics.items()}
+    arr = np.array(list(vals.values()))
+    if len(arr) < 4:
+        return vals
+    mean, std = float(arr.mean()), float(arr.std())
+    if std < 0.05:
+        return vals
+    cleaned = {}
+    for k, v in vals.items():
+        if v < mean - 2.0 * std:
+            cleaned[k] = 0.0
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
 def _compare(img1, img2_ref):
     """Compare input image against a reference using multiple metrics."""
     h, w = STD_SIZE[1], STD_SIZE[0]
 
     # Align input to reference first
     aligned = _align_images(img1, img2_ref)
+
+    # Stats for dynamic weighting
+    hsv_full = cv2.cvtColor(aligned, cv2.COLOR_BGR2HSV)
+    img_stats = {
+        "mean_v": float(hsv_full[:, :, 2].mean()),
+        "mean_s": float(hsv_full[:, :, 1].mean()),
+    }
+
+    # Body ROI for color-based metrics (avoid cap / handle noise)
+    body_aligned, _ = _body_roi(aligned)
+    body_ref, _ = _body_roi(img2_ref)
 
     # --- A: Brightness profile correlation ---
     g1 = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(float)
@@ -256,20 +466,18 @@ def _compare(img1, img2_ref):
     mse_upper = float(np.mean((upper1.astype(float) - upper2.astype(float)) ** 2))
     upper_sim = max(0.0, 1.0 - mse_upper / 5000.0)
 
-    # --- C: Golden oil amount (total oil visible) ---
+    # --- C: Golden oil amount (adaptive HSV, measured on body ROI) ---
     def golden_amount(img):
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
+        mask = _adaptive_oil_mask(img)
         return mask.sum() / (mask.shape[0] * mask.shape[1] * 255)
 
-    ga1 = golden_amount(aligned)
-    ga2 = golden_amount(img2_ref)
+    ga1 = golden_amount(body_aligned)
+    ga2 = golden_amount(body_ref)
     golden_sim = max(0.0, 1.0 - abs(ga1 - ga2) * 5.0)
 
     # --- D: Golden vertical profile (WHERE is oil) ---
     def golden_profile(img):
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
+        mask = _adaptive_oil_mask(img)
         profile = mask.mean(axis=1) / 255.0
         return np.convolve(profile, np.ones(15) / 15, mode="same")
 
@@ -280,10 +488,8 @@ def _compare(img1, img2_ref):
     gp_sim = max(0.0, 1.0 - gp_diff * 4.0)
 
     # --- E: HSV histogram on body ---
-    b1 = aligned[int(h * 0.2):int(h * 0.8)]
-    b2 = img2_ref[int(h * 0.2):int(h * 0.8)]
-    hh1 = cv2.calcHist([cv2.cvtColor(b1, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    hh2 = cv2.calcHist([cv2.cvtColor(b2, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    hh1 = cv2.calcHist([cv2.cvtColor(body_aligned, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    hh2 = cv2.calcHist([cv2.cvtColor(body_ref, cv2.COLOR_BGR2HSV)], [0, 1], None, [30, 32], [0, 180, 0, 256])
     cv2.normalize(hh1, hh1)
     cv2.normalize(hh2, hh2)
     hsv_score = float(cv2.compareHist(hh1, hh2, cv2.HISTCMP_CORREL))
@@ -295,23 +501,31 @@ def _compare(img1, img2_ref):
     kp1, d1 = orb.detectAndCompute(gray1, None)
     kp2, d2 = orb.detectAndCompute(gray2, None)
     orb_score = 0.0
+    orb_raw = 0
     if d1 is not None and d2 is not None:
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         matches = bf.match(d1, d2)
         good = [m for m in matches if m.distance < 50]
-        orb_score = min(1.0, len(good) / 30.0)
+        orb_raw = len(good)
+        orb_score = min(1.0, orb_raw / 30.0)
 
-    # --- Combined score (ML-style weights) ---
-    combined = (
-        golden_sim * 0.20 +
-        gp_sim * 0.20 +
-        upper_sim * 0.20 +
-        max(0, bright_corr) * 0.15 +
-        max(0, hsv_score) * 0.15 +
-        orb_score * 0.10
+    raw_metrics = {
+        "golden_sim": golden_sim,
+        "gp_sim": gp_sim,
+        "upper_sim": upper_sim,
+        "bright_corr": max(0.0, bright_corr),
+        "hsv_score": max(0.0, hsv_score),
+        "orb_score": orb_score,
+    }
+
+    # Reject single-outlier metrics then apply dynamic weights
+    cleaned = _reject_outliers(raw_metrics)
+    weights = _dynamic_weights(
+        {"orb_raw_matches": orb_raw}, img_stats
     )
 
-    return combined
+    combined = sum(cleaned[k] * weights[k] for k in weights)
+    return float(combined)
 
 
 # =====================================================================
@@ -319,6 +533,120 @@ def _compare(img1, img2_ref):
 # =====================================================================
 
 _CACHED_REFS = None
+_DB_REF_CACHE_KEY = "oil_references_v1"
+
+
+def invalidate_reference_cache():
+    """Clear both in-memory and Django cache for oil references.
+
+    Called from the OilReference post_save / post_delete signal so that
+    admin edits take effect on the next scan without a server restart.
+    """
+    global _CACHED_REFS
+    _CACHED_REFS = None
+    try:
+        from django.core.cache import cache
+        cache.delete(_DB_REF_CACHE_KEY)
+    except Exception:
+        pass
+
+
+def extract_reference_features(image_path: str):
+    """Extract and cache all features needed to classify a reference image.
+
+    Persists the normalized bottle crop as .npy (under MEDIA/reference_cached)
+    and returns a dict of JSON-serializable features for the DB row.
+    """
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise ProcessingError(f"Unable to read reference image: {image_path}")
+
+    bottle_crop, _ = _crop_bottle(img)
+    normalized = _normalize(bottle_crop)
+    body, _ = _body_roi(normalized)
+
+    # Brightness profile (per-row mean of grayscale, 1D array)
+    gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY).astype(float)
+    brightness_profile = gray.mean(axis=1).tolist()
+
+    # Golden profile (adaptive mask per-row mean)
+    mask = _adaptive_oil_mask(normalized)
+    golden_profile_arr = mask.mean(axis=1) / 255.0
+    golden_profile_arr = np.convolve(golden_profile_arr, np.ones(15) / 15, mode="same")
+    golden_profile = golden_profile_arr.tolist()
+
+    # Golden amount (scalar 0-1)
+    body_mask = _adaptive_oil_mask(body)
+    golden_amt = float(body_mask.sum() / (body_mask.shape[0] * body_mask.shape[1] * 255))
+
+    # H-S histogram on body (flattened list of floats)
+    hist = cv2.calcHist(
+        [cv2.cvtColor(body, cv2.COLOR_BGR2HSV)],
+        [0, 1], None, [30, 32], [0, 180, 0, 256],
+    )
+    cv2.normalize(hist, hist)
+    histogram = hist.flatten().tolist()
+
+    # Persist the normalized npy so _load_references can mmap it quickly.
+    cache_dir = CACHE_DIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(image_path).stem
+    npy_rel = f"reference_cached/db_{stem}_{uuid.uuid4().hex[:8]}.npy"
+    npy_path = Path(settings.MEDIA_ROOT) / npy_rel
+    np.save(str(npy_path), normalized)
+
+    return {
+        "brightness_profile": brightness_profile,
+        "histogram": histogram,
+        "golden_profile": golden_profile,
+        "golden_amount": golden_amt,
+        "normalized_cache_path": npy_rel,
+    }
+
+
+def _load_references_from_db():
+    """Load active OilReference rows. Returns [] if none exist.
+
+    Results are cached via django.core.cache (1h TTL) and additionally
+    memoized in the module-level _CACHED_REFS for the hot path.
+    """
+    try:
+        from django.core.cache import cache
+        from oil.models import OilReference
+    except Exception as e:
+        logger.warning("OilReference DB access unavailable: %s", e)
+        return []
+
+    cached = cache.get(_DB_REF_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    refs = []
+    qs = OilReference.objects.filter(is_active=True).order_by("-level_percentage")
+    for row in qs:
+        npy_rel = row.normalized_cache_path
+        if not npy_rel:
+            continue
+        npy_path = Path(npy_rel)
+        if not npy_path.is_absolute():
+            npy_path = Path(settings.MEDIA_ROOT) / npy_rel
+        if not npy_path.exists():
+            logger.warning("OilReference %s missing cache file: %s", row.pk, npy_path)
+            continue
+        try:
+            normalized = np.load(str(npy_path))
+            refs.append({
+                "level": float(row.level_percentage),
+                "normalized": normalized,
+                "source": "db",
+                "id": row.pk,
+            })
+        except Exception as e:
+            logger.warning("Failed loading OilReference %s: %s", row.pk, e)
+
+    cache.set(_DB_REF_CACHE_KEY, refs, timeout=3600)
+    logger.info("Loaded %d references from DB", len(refs))
+    return refs
 
 
 def _build_cache():
@@ -354,17 +682,29 @@ def _load_references():
     if _CACHED_REFS is not None:
         return _CACHED_REFS
 
-    _build_cache()
+    # Prefer admin-managed references from the DB.
+    db_refs = _load_references_from_db()
+    if len(db_refs) >= 3:
+        _CACHED_REFS = db_refs
+        return db_refs
 
+    # Fallback: bundled folder references (initial install / empty DB).
+    _build_cache()
     references = []
     for filename, level in REFERENCE_LEVELS:
         stem = Path(filename).stem
         npy_path = CACHE_DIR / f"{stem}.npy"
         if npy_path.exists():
             normalized = np.load(str(npy_path))
-            references.append({"level": level, "normalized": normalized})
+            references.append({"level": level, "normalized": normalized, "source": "folder"})
 
-    logger.info("Loaded %d references", len(references))
+    # If both DB and folder have partial data, merge (DB wins on duplicate level).
+    if db_refs:
+        seen_levels = {r["level"] for r in db_refs}
+        references = db_refs + [r for r in references if r["level"] not in seen_levels]
+
+    logger.info("Loaded %d references (db=%d, folder=%d)",
+                len(references), len(db_refs), len(references) - len(db_refs))
     _CACHED_REFS = references
     return references
 
@@ -427,6 +767,30 @@ def process_bottle_image(image_path: str, bottle_spec):
 
     results = _find_match(input_norm, references)
     oil_level, confidence = _interpolate(results)
+
+    # --- Direct oil-line detection blend ---
+    # Trust the edge-based reading only if it lands within ±15% of the
+    # reference-match reading; otherwise the edge is most likely a label
+    # border and the reference match is more reliable.
+    edge_y_rel, edge_conf = _detect_oil_line_direct(bottle_crop)
+    if edge_y_rel is not None:
+        edge_level = (1.0 - edge_y_rel) * 100.0
+        diff = abs(edge_level - oil_level)
+        if diff <= 15.0 and edge_conf >= 0.45:
+            blend_w = min(0.4, edge_conf * 0.5)
+            oil_level = oil_level * (1 - blend_w) + edge_level * blend_w
+            confidence = min(0.96, confidence + 0.04)
+            logger.info(
+                "Edge-blend: edge=%.1f%% ref=%.1f%% diff=%.1f weight=%.2f",
+                edge_level, results[0]["level"], diff, blend_w,
+            )
+        else:
+            logger.info(
+                "Edge ignored: edge=%.1f%% ref=%.1f%% diff=%.1f conf=%.2f",
+                edge_level, results[0]["level"], diff, edge_conf,
+            )
+
+    oil_level = int(round(oil_level))
     oil_ratio = oil_level / 100.0
 
     total = float(bottle_spec.total_volume_liters)

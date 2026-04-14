@@ -1,5 +1,8 @@
+import logging
 import uuid
 from django.db import models
+
+logger = logging.getLogger(__name__)
 
 
 class BottleSpecification(models.Model):
@@ -46,6 +49,122 @@ class BottleReferenceImage(models.Model):
     image = models.ImageField(upload_to="reference_bottles/")
     note = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class OilReference(models.Model):
+    """Admin-managed reference image for a single calibrated oil level.
+
+    Replaces the hard-coded folder of reference images: admins can upload,
+    replace or retire a reference without a code deploy. Features are
+    auto-extracted and cached as JSON on save; the normalized bottle crop
+    is persisted to MEDIA as an .npy for fast re-use at scan time.
+    """
+
+    bottle = models.ForeignKey(
+        BottleSpecification,
+        on_delete=models.CASCADE,
+        related_name="oil_references",
+        null=True,
+        blank=True,
+        help_text="Bottle spec this reference belongs to (optional).",
+    )
+    image = models.ImageField(upload_to="oil_references/")
+    level_percentage = models.FloatField(
+        help_text="Oil level as a percentage (0-100).",
+    )
+    version = models.PositiveIntegerField(
+        default=1,
+        help_text="Bumped on every re-extraction — enables rollback.",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Only active references are used at scan time.",
+    )
+    notes = models.CharField(max_length=255, blank=True)
+
+    # Cached features (populated by save())
+    brightness_profile = models.JSONField(null=True, blank=True)
+    histogram = models.JSONField(null=True, blank=True)
+    golden_profile = models.JSONField(null=True, blank=True)
+    golden_amount = models.FloatField(null=True, blank=True)
+    normalized_cache_path = models.CharField(max_length=500, blank=True)
+    extraction_error = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-level_percentage"]
+        indexes = [
+            models.Index(fields=["is_active", "level_percentage"]),
+        ]
+
+    def __str__(self):
+        bottle_label = self.bottle.bottle_name if self.bottle_id else "—"
+        return f"{bottle_label} @ {self.level_percentage:.0f}% (v{self.version})"
+
+    @property
+    def has_features(self):
+        return bool(self.normalized_cache_path and self.histogram)
+
+    def extract_features(self):
+        """Extract and persist features from the uploaded image.
+
+        Bypasses .save() via QuerySet.update() to avoid recursion, then
+        refreshes the in-memory instance and invalidates the shared cache.
+        """
+        from oil.services.image_processing import (
+            extract_reference_features,
+            invalidate_reference_cache,
+        )
+
+        if not self.image:
+            return
+
+        try:
+            features = extract_reference_features(self.image.path)
+        except Exception as e:
+            logger.exception("Feature extraction failed for OilReference %s", self.pk)
+            OilReference.objects.filter(pk=self.pk).update(
+                extraction_error=str(e)[:2000],
+            )
+            self.refresh_from_db(fields=["extraction_error"])
+            return
+
+        OilReference.objects.filter(pk=self.pk).update(
+            brightness_profile=features["brightness_profile"],
+            histogram=features["histogram"],
+            golden_profile=features["golden_profile"],
+            golden_amount=features["golden_amount"],
+            normalized_cache_path=features["normalized_cache_path"],
+            extraction_error="",
+            version=models.F("version") + 1,
+        )
+        self.refresh_from_db()
+        invalidate_reference_cache()
+
+    def save(self, *args, **kwargs):
+        skip_extract = kwargs.pop("skip_extract", False)
+        is_new = self.pk is None
+        image_changed = False
+        if not is_new:
+            try:
+                old = OilReference.objects.only("image").get(pk=self.pk)
+                image_changed = bool(old.image) and old.image.name != self.image.name
+            except OilReference.DoesNotExist:
+                image_changed = True
+
+        super().save(*args, **kwargs)
+
+        if skip_extract:
+            return
+
+        needs_extract = (
+            self.image
+            and (is_new or image_changed or not self.normalized_cache_path)
+        )
+        if needs_extract:
+            self.extract_features()
 
 
 class ScanSession(models.Model):

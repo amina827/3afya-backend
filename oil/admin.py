@@ -1,7 +1,9 @@
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.utils.html import format_html
 from .models import (
     BottleSpecification,
     BottleReferenceImage,
+    OilReference,
     ScanSession,
     ScanImage,
     CupTarget,
@@ -109,6 +111,118 @@ class VerificationLogAdmin(admin.ModelAdmin):
     @admin.display(description="QR Data")
     def qr_data_short(self, obj):
         return obj.qr_data[:40] + "..." if len(obj.qr_data) > 40 else obj.qr_data
+
+
+@admin.register(OilReference)
+class OilReferenceAdmin(admin.ModelAdmin):
+    list_display = (
+        "level_percentage",
+        "bottle",
+        "version",
+        "is_active",
+        "features_status",
+        "thumbnail",
+        "updated_at",
+    )
+    list_filter = ("is_active", "bottle", "level_percentage")
+    search_fields = ("notes", "bottle__bottle_name")
+    list_editable = ("is_active",)
+    readonly_fields = (
+        "version",
+        "golden_amount",
+        "normalized_cache_path",
+        "extraction_error",
+        "features_summary",
+        "created_at",
+        "updated_at",
+    )
+    actions = ["rebuild_features", "activate_refs", "deactivate_refs"]
+    fieldsets = (
+        (None, {
+            "fields": ("bottle", "image", "level_percentage", "is_active", "notes"),
+        }),
+        ("Cached features", {
+            "classes": ("collapse",),
+            "fields": (
+                "version",
+                "golden_amount",
+                "normalized_cache_path",
+                "features_summary",
+                "extraction_error",
+            ),
+        }),
+        ("Timestamps", {
+            "classes": ("collapse",),
+            "fields": ("created_at", "updated_at"),
+        }),
+    )
+
+    @admin.display(description="Features")
+    def features_status(self, obj):
+        if obj.extraction_error:
+            return format_html('<span style="color:#c00;">ERROR</span>')
+        if obj.has_features:
+            return format_html('<span style="color:#080;">ready</span>')
+        return format_html('<span style="color:#999;">pending</span>')
+
+    @admin.display(description="Preview")
+    def thumbnail(self, obj):
+        if obj.image:
+            return format_html(
+                '<img src="{}" style="height:48px;border-radius:3px;" />',
+                obj.image.url,
+            )
+        return "—"
+
+    @admin.display(description="Feature summary")
+    def features_summary(self, obj):
+        if not obj.has_features:
+            return "—"
+        bp = obj.brightness_profile or []
+        gp = obj.golden_profile or []
+        hist = obj.histogram or []
+        return format_html(
+            "brightness_profile: {} rows<br>"
+            "golden_profile: {} rows<br>"
+            "histogram: {} bins<br>"
+            "golden_amount: {:.4f}",
+            len(bp), len(gp), len(hist), obj.golden_amount or 0.0,
+        )
+
+    @admin.action(description="Rebuild cached features")
+    def rebuild_features(self, request, queryset):
+        ok, failed = 0, 0
+        for ref in queryset:
+            try:
+                ref.extract_features()
+                if ref.has_features:
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                self.message_user(
+                    request, f"#{ref.pk}: {e}", level=messages.ERROR,
+                )
+        self.message_user(
+            request,
+            f"Rebuilt {ok} reference(s); {failed} failed.",
+            level=messages.SUCCESS if failed == 0 else messages.WARNING,
+        )
+
+    @admin.action(description="Activate selected references")
+    def activate_refs(self, request, queryset):
+        updated = queryset.update(is_active=True)
+        from oil.services.image_processing import invalidate_reference_cache
+        invalidate_reference_cache()
+        self.message_user(request, f"Activated {updated} reference(s).")
+
+    @admin.action(description="Deactivate selected references")
+    def deactivate_refs(self, request, queryset):
+        updated = queryset.update(is_active=False)
+        from oil.services.image_processing import invalidate_reference_cache
+        invalidate_reference_cache()
+        self.message_user(request, f"Deactivated {updated} reference(s).")
 
 
 @admin.register(TrainingImage)
