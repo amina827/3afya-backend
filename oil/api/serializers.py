@@ -86,15 +86,61 @@ class ScanResultSerializer(serializers.ModelSerializer):
 
 class TargetLevelSerializer(serializers.Serializer):
     scan_id = serializers.UUIDField()
-    target_cups = serializers.FloatField()
+    target_cups = serializers.FloatField(
+        required=False,
+        help_text="Target cups (e.g. 0.5, 1, 1.5). Either this OR target_volume_ml is required.",
+    )
+    target_volume_ml = serializers.FloatField(
+        required=False, min_value=0,
+        help_text="Target volume in ml. Either this OR target_cups is required.",
+    )
+
+    def validate(self, attrs):
+        cups = attrs.get("target_cups")
+        ml = attrs.get("target_volume_ml")
+        if cups is None and ml is None:
+            raise serializers.ValidationError(
+                "Provide either target_cups or target_volume_ml."
+            )
+        if cups is not None and ml is not None:
+            raise serializers.ValidationError(
+                "Provide only one of target_cups or target_volume_ml, not both."
+            )
+        return attrs
 
 
 class TargetResponseSerializer(serializers.ModelSerializer):
     target_image_url = serializers.SerializerMethodField()
+    target_volume_ml = serializers.SerializerMethodField()
+    level_position_percent = serializers.SerializerMethodField()
+    cup_ml = serializers.SerializerMethodField()
 
     class Meta:
         model = CupTarget
-        fields = ["scan", "target_cups", "target_image_url"]
+        fields = [
+            "scan",
+            "target_cups",
+            "target_volume_ml",
+            "level_position_percent",
+            "cup_ml",
+            "target_image_url",
+        ]
+
+    def _cup_ml(self, obj):
+        return float(obj.scan.bottle.cup_conversion_ratio) * 1000.0
+
+    def get_cup_ml(self, obj):
+        return round(self._cup_ml(obj), 2)
+
+    def get_target_volume_ml(self, obj):
+        return round(obj.target_cups * self._cup_ml(obj), 2)
+
+    def get_level_position_percent(self, obj):
+        total_ml = float(obj.scan.bottle.total_volume_liters) * 1000.0
+        if total_ml <= 0:
+            return 0.0
+        volume_ml = obj.target_cups * self._cup_ml(obj)
+        return round(max(0.0, min(100.0, (volume_ml / total_ml) * 100.0)), 2)
 
     def get_target_image_url(self, obj):
         request = self.context.get("request")
@@ -103,6 +149,24 @@ class TargetResponseSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(obj.target_image.url)
         return obj.target_image.url
+
+
+class SliderStepSerializer(serializers.Serializer):
+    index = serializers.IntegerField()
+    cups = serializers.FloatField()
+    volume_ml = serializers.FloatField()
+    position_percent = serializers.FloatField()
+    label = serializers.CharField()
+
+
+class SliderConfigSerializer(serializers.Serializer):
+    bottle_id = serializers.CharField()
+    bottle_name = serializers.CharField()
+    total_volume_ml = serializers.FloatField()
+    cup_ml = serializers.FloatField()
+    step_ml = serializers.FloatField()
+    max_cups = serializers.FloatField()
+    steps = SliderStepSerializer(many=True)
 
 
 class FeedbackSerializer(serializers.ModelSerializer):

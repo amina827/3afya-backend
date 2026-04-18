@@ -21,6 +21,7 @@ from oil.api.serializers import (
     TrainingStatsSerializer,
     VerifyQRSerializer,
     VerifyResultSerializer,
+    SliderConfigSerializer,
 )
 from oil.services.image_processing import render_target_overlay, ProcessingError
 from oil.tasks import process_scan_image
@@ -157,23 +158,87 @@ class TargetLevelView(APIView):
         if not hasattr(scan, "image"):
             return Response({"error": "Scan image not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        cup_ml = float(scan.bottle.cup_conversion_ratio) * 1000.0
+        if "target_cups" in serializer.validated_data:
+            target_cups = float(serializer.validated_data["target_cups"])
+        else:
+            target_volume_ml = float(serializer.validated_data["target_volume_ml"])
+            if cup_ml <= 0:
+                return Response(
+                    {"error": "Bottle cup_conversion_ratio is not configured."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            target_cups = target_volume_ml / cup_ml
+
         try:
             target_image_path = render_target_overlay(
                 scan.image.original_image.path,
                 scan.bottle,
-                serializer.validated_data["target_cups"],
+                target_cups,
             )
         except ProcessingError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         target = CupTarget.objects.create(
             scan=scan,
-            target_cups=serializer.validated_data["target_cups"],
+            target_cups=target_cups,
             target_image=target_image_path,
         )
 
         response = TargetResponseSerializer(target, context={"request": request}).data
         return Response(response, status=status.HTTP_201_CREATED)
+
+
+class SliderConfigView(APIView):
+    @swagger_auto_schema(
+        operation_id="slider_config",
+        operation_description=(
+            "Return slider configuration for a bottle: total volume, step size, "
+            "cup size, and the list of snappable steps (each with cups, ml, and "
+            "position_percent on the bottle image). Use this to render the oil "
+            "volume slider on the client."
+        ),
+        responses={200: SliderConfigSerializer, 404: "Bottle not found."},
+    )
+    def get(self, request, bottle_id):
+        bottle = get_object_or_404(BottleSpecification, bottle_id=bottle_id)
+
+        total_ml = float(bottle.total_volume_liters) * 1000.0
+        cup_ml = float(bottle.cup_conversion_ratio) * 1000.0
+        step_ml = cup_ml / 2.0  # half a cup per step
+
+        steps = []
+        if step_ml > 0 and total_ml > 0:
+            n_steps = int(total_ml // step_ml)
+            for i in range(1, n_steps + 1):
+                volume_ml = round(i * step_ml, 2)
+                cups = round(volume_ml / cup_ml, 2)
+                position = round((volume_ml / total_ml) * 100.0, 2)
+                if cups == int(cups):
+                    label = f"{int(cups)} كوب"
+                elif abs(cups - 0.5) < 1e-6:
+                    label = "½ كوب"
+                else:
+                    whole = int(cups)
+                    label = f"{whole}½ كوب" if whole else "½ كوب"
+                steps.append({
+                    "index": i,
+                    "cups": cups,
+                    "volume_ml": volume_ml,
+                    "position_percent": position,
+                    "label": label,
+                })
+
+        payload = {
+            "bottle_id": bottle.bottle_id,
+            "bottle_name": bottle.bottle_name,
+            "total_volume_ml": round(total_ml, 2),
+            "cup_ml": round(cup_ml, 2),
+            "step_ml": round(step_ml, 2),
+            "max_cups": round(total_ml / cup_ml, 2) if cup_ml > 0 else 0.0,
+            "steps": steps,
+        }
+        return Response(SliderConfigSerializer(payload).data, status=status.HTTP_200_OK)
 
 
 class FeedbackView(APIView):
