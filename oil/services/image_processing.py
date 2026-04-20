@@ -40,16 +40,28 @@ def _ensure_dir(path: Path):
 # Reference data
 # =====================================================================
 
-# Calibrated 1.5L Afia bottle references (200ml per cup, 7.5 cups total)
+# Calibrated 1.5L Afia bottle references.
+# 17 levels evenly spaced from 100% → 0% (~6.25% per step), produced by
+# pouring ~100ml out for each successive photo. Finer granularity than the
+# original 8-level set → smaller interpolation error between neighbors.
 REFERENCE_LEVELS = [
-    ("level_100.png", 100),  # 1500ml - full
-    ("level_087.png", 87),   # 1300ml - 6.5 cups
-    ("level_073.png", 73),   # 1100ml - 5.5 cups
-    ("level_060.png", 60),   # 900ml  - 4.5 cups
-    ("level_047.png", 47),   # 700ml  - 3.5 cups
-    ("level_033.png", 33),   # 500ml  - 2.5 cups
-    ("level_020.png", 20),   # 300ml  - 1.5 cups
-    ("level_007.png", 7),    # 100ml  - 0.5 cups
+    ("level_100.jpg", 100),
+    ("level_094.jpg", 94),
+    ("level_088.jpg", 88),
+    ("level_081.jpg", 81),
+    ("level_075.jpg", 75),
+    ("level_069.jpg", 69),
+    ("level_063.jpg", 63),
+    ("level_056.jpg", 56),
+    ("level_050.jpg", 50),
+    ("level_044.jpg", 44),
+    ("level_038.jpg", 38),
+    ("level_031.jpg", 31),
+    ("level_025.jpg", 25),
+    ("level_019.jpg", 19),
+    ("level_013.jpg", 13),
+    ("level_006.jpg", 6),
+    ("level_000.jpg", 0),
 ]
 
 # Reference images are calibration assets that ship with the source code,
@@ -656,11 +668,14 @@ def _build_cache():
     for filename, level in REFERENCE_LEVELS:
         stem = Path(filename).stem
         npy_path = cache_dir / f"{stem}.npy"
-        if npy_path.exists():
-            continue
-
         img_path = REFERENCE_DIR / filename
         if not img_path.exists():
+            continue
+
+        # Rebuild cache when the source image has been updated so that
+        # replacing a reference file (e.g. recalibration) takes effect
+        # without manually clearing MEDIA/reference_cached.
+        if npy_path.exists() and npy_path.stat().st_mtime >= img_path.stat().st_mtime:
             continue
 
         img = cv2.imread(str(img_path))
@@ -728,14 +743,31 @@ def _find_match(input_norm, references):
 
 
 def _interpolate(results):
+    """Softmax-weighted interpolation over the top matches.
+
+    With ~17 references at ~6% spacing, the top few matches tend to be
+    close neighbors on the level axis. A temperature-sharpened softmax
+    blends them so the returned percentage can fall between reference
+    buckets instead of snapping to one of them.
+
+    Outlier rejection: only references whose level is within 12% of the
+    top match contribute, so an unrelated high-score far-away level
+    (rare but possible when the scene is ambiguous) cannot drag the
+    result toward it.
+    """
     best = results[0]
-    second = results[1] if len(results) > 1 else best
 
-    if abs(best["level"] - second["level"]) <= 15:
-        level = best["level"] * 0.75 + second["level"] * 0.25
+    close = [r for r in results[:5] if abs(r["level"] - best["level"]) <= 12]
+    if len(close) >= 2:
+        scores = np.array([r["score"] for r in close], dtype=float)
+        # Subtract max for numerical stability, then sharpen.
+        weights = np.exp((scores - scores.max()) * 18.0)
+        weights /= weights.sum()
+        level = float(sum(w * r["level"] for w, r in zip(weights, close)))
     else:
-        level = best["level"]
+        level = float(best["level"])
 
+    second = results[1] if len(results) > 1 else best
     gap = best["score"] - second["score"]
     confidence = 0.60
     confidence += min(0.20, best["score"] * 0.25)

@@ -37,6 +37,19 @@ class Command(BaseCommand):
                 "references will be created without a bottle link."
             ))
 
+        # Deactivate rows whose level isn't part of the current reference set
+        # — keeps the classifier from mixing stale calibrations (e.g. the old
+        # 8-level set) with a freshly seeded 17-level set.
+        current_levels = {float(level) for _, level in REFERENCE_LEVELS}
+        deactivated = OilReference.objects.filter(
+            bottle=bottle, is_active=True,
+        ).exclude(level_percentage__in=current_levels).update(is_active=False)
+        if deactivated:
+            self.stdout.write(self.style.WARNING(
+                f"Deactivated {deactivated} stale reference row(s) "
+                "with levels no longer in REFERENCE_LEVELS."
+            ))
+
         created, updated, skipped = 0, 0, 0
         for filename, level in REFERENCE_LEVELS:
             src = Path(REFERENCE_DIR) / filename
