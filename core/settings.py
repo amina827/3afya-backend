@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 
 from pathlib import Path
 import os
+from importlib.util import find_spec
+from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,16 +56,17 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    "corsheaders",
     "rest_framework",
-    "drf_yasg",
     "oil",
 ]
 
+if find_spec("corsheaders"):
+    INSTALLED_APPS.append("corsheaders")
+if find_spec("drf_yasg"):
+    INSTALLED_APPS.append("drf_yasg")
+
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -71,6 +74,11 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+if find_spec("corsheaders"):
+    MIDDLEWARE.insert(0, "corsheaders.middleware.CorsMiddleware")
+if find_spec("whitenoise"):
+    MIDDLEWARE.insert(1, "whitenoise.middleware.WhiteNoiseMiddleware")
 
 ROOT_URLCONF = 'core.urls'
 
@@ -100,13 +108,41 @@ WSGI_APPLICATION = 'core.wsgi.application'
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if DATABASE_URL:
-    import dj_database_url
+    try:
+        import dj_database_url
 
-    DATABASES = {
-        "default": dj_database_url.parse(
-            DATABASE_URL, conn_max_age=600, ssl_require=False
-        )
-    }
+        DATABASES = {
+            "default": dj_database_url.parse(
+                DATABASE_URL, conn_max_age=600, ssl_require=False
+            )
+        }
+    except ImportError:
+        parsed = urlparse(DATABASE_URL)
+        scheme = parsed.scheme.lower()
+
+        if scheme in {"postgres", "postgresql"}:
+            DATABASES = {
+                "default": {
+                    "ENGINE": "django.db.backends.postgresql",
+                    "NAME": unquote(parsed.path.lstrip("/") or os.getenv("POSTGRES_DB", "afia")),
+                    "USER": unquote(parsed.username or os.getenv("POSTGRES_USER", "postgres")),
+                    "PASSWORD": unquote(parsed.password or os.getenv("POSTGRES_PASSWORD", "postgres")),
+                    "HOST": parsed.hostname or os.getenv("POSTGRES_HOST", "localhost"),
+                    "PORT": str(parsed.port or os.getenv("POSTGRES_PORT", "5432")),
+                }
+            }
+        elif scheme == "sqlite":
+            DATABASES = {
+                "default": {
+                    "ENGINE": "django.db.backends.sqlite3",
+                    "NAME": unquote(parsed.path) if parsed.path else BASE_DIR / "db.sqlite3",
+                }
+            }
+        else:
+            raise RuntimeError(
+                f"Unsupported DATABASE_URL scheme '{parsed.scheme}'. "
+                "Install dj-database-url for additional database schemes."
+            )
 elif os.getenv("USE_SQLITE", "1") == "1":
     DATABASES = {
         "default": {
@@ -172,7 +208,8 @@ TIME_ZONE = os.getenv("DJANGO_TIME_ZONE", "UTC")
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+if find_spec("whitenoise"):
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
@@ -221,4 +258,3 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv("DATA_UPLOAD_MAX_MEMORY_SIZE", "1048
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_SECURE = os.getenv("DJANGO_SECURE_COOKIES", "0") == "1"
 CSRF_COOKIE_SECURE = os.getenv("DJANGO_SECURE_COOKIES", "0") == "1"
-

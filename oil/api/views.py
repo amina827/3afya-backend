@@ -114,6 +114,8 @@ class ScanResultView(APIView):
                                     items=openapi.Schema(type=openapi.TYPE_NUMBER),
                                 ),
                                 "remaining_liters_estimate": openapi.Schema(type=openapi.TYPE_NUMBER),
+                                "oil_percentage": openapi.Schema(type=openapi.TYPE_NUMBER),
+                                "oil_line_position_from_top": openapi.Schema(type=openapi.TYPE_NUMBER),
                                 "processed_image_url": openapi.Schema(type=openapi.TYPE_STRING),
                                 "confidence_score": openapi.Schema(type=openapi.TYPE_NUMBER),
                                 "processing_time_ms": openapi.Schema(type=openapi.TYPE_INTEGER),

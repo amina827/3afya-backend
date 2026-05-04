@@ -6,6 +6,10 @@ services:
       - 8000:8000
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      DATABASE_URL: postgres://postgres:postgres@db:5432/afia
     networks:
       - backend-network
     depends_on:
@@ -15,7 +19,7 @@ services:
     image: postgres:15-alpine
     container_name: afia-db
     ports:
-      - 5435:5432
+      - 5432:5432
     env_file:
       - .env
     volumes:

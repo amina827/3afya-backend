@@ -34,6 +34,8 @@ class ScanResultSerializer(serializers.ModelSerializer):
     original_image_url = serializers.SerializerMethodField()
     consumed_cups_range = serializers.SerializerMethodField()
     remaining_liters_estimate = serializers.SerializerMethodField()
+    oil_percentage = serializers.SerializerMethodField()
+    oil_line_position_from_top = serializers.SerializerMethodField()
 
     class Meta:
         model = ScanImage
@@ -46,6 +48,8 @@ class ScanResultSerializer(serializers.ModelSerializer):
             "consumed_cups",
             "consumed_cups_range",
             "remaining_liters_estimate",
+            "oil_percentage",
+            "oil_line_position_from_top",
             "processed_image_url",
             "original_image_url",
             "bottle_bbox",
@@ -83,6 +87,17 @@ class ScanResultSerializer(serializers.ModelSerializer):
             return None
         return round(obj.remaining_volume_liters, 3)
 
+    def get_oil_percentage(self, obj):
+        if obj.oil_ratio is None:
+            return None
+        return round(obj.oil_ratio * 100.0, 2)
+
+    def get_oil_line_position_from_top(self, obj):
+        """Normalized line position in bottle space (0.0=top, 1.0=bottom)."""
+        if obj.oil_ratio is None:
+            return None
+        return round(1.0 - float(obj.oil_ratio), 4)
+
 
 class TargetLevelSerializer(serializers.Serializer):
     scan_id = serializers.UUIDField()
@@ -114,6 +129,10 @@ class TargetResponseSerializer(serializers.ModelSerializer):
     target_volume_ml = serializers.SerializerMethodField()
     level_position_percent = serializers.SerializerMethodField()
     cup_ml = serializers.SerializerMethodField()
+    target_volume_liters = serializers.SerializerMethodField()
+    target_ratio = serializers.SerializerMethodField()
+    target_percentage = serializers.SerializerMethodField()
+    target_line_position_from_top = serializers.SerializerMethodField()
 
     class Meta:
         model = CupTarget
@@ -123,24 +142,15 @@ class TargetResponseSerializer(serializers.ModelSerializer):
             "target_volume_ml",
             "level_position_percent",
             "cup_ml",
+            "target_volume_liters",
+            "target_ratio",
+            "target_percentage",
+            "target_line_position_from_top",
             "target_image_url",
         ]
 
     def _cup_ml(self, obj):
         return float(obj.scan.bottle.cup_conversion_ratio) * 1000.0
-
-    def get_cup_ml(self, obj):
-        return round(self._cup_ml(obj), 2)
-
-    def get_target_volume_ml(self, obj):
-        return round(obj.target_cups * self._cup_ml(obj), 2)
-
-    def get_level_position_percent(self, obj):
-        total_ml = float(obj.scan.bottle.total_volume_liters) * 1000.0
-        if total_ml <= 0:
-            return 0.0
-        volume_ml = obj.target_cups * self._cup_ml(obj)
-        return round(max(0.0, min(100.0, (volume_ml / total_ml) * 100.0)), 2)
 
     def get_target_image_url(self, obj):
         request = self.context.get("request")
@@ -149,6 +159,40 @@ class TargetResponseSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(obj.target_image.url)
         return obj.target_image.url
+
+    def get_cup_ml(self, obj):
+        return round(self._cup_ml(obj), 2)
+
+    def get_target_volume_ml(self, obj):
+        return round(obj.target_cups * self._cup_ml(obj), 2)
+
+    def get_level_position_percent(self, obj):
+        """Oil amount percentage where 100 means full bottle."""
+        ratio = self.get_target_ratio(obj)
+        return round(ratio * 100.0, 2)
+
+    def get_target_volume_liters(self, obj):
+        bottle = obj.scan.bottle
+        liters = float(obj.target_cups) * float(bottle.cup_conversion_ratio)
+        return round(max(0.0, liters), 3)
+
+    def get_target_ratio(self, obj):
+        bottle = obj.scan.bottle
+        total = float(bottle.total_volume_liters)
+        if total <= 0:
+            return 0.0
+        liters = float(obj.target_cups) * float(bottle.cup_conversion_ratio)
+        ratio = max(0.0, min(1.0, liters / total))
+        return round(ratio, 4)
+
+    def get_target_percentage(self, obj):
+        ratio = self.get_target_ratio(obj)
+        return round(ratio * 100.0, 2)
+
+    def get_target_line_position_from_top(self, obj):
+        """Normalized line position in bottle space (0.0=top, 1.0=bottom)."""
+        ratio = self.get_target_ratio(obj)
+        return round(1.0 - ratio, 4)
 
 
 class SliderStepSerializer(serializers.Serializer):
