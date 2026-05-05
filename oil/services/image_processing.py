@@ -918,26 +918,53 @@ def process_bottle_image(image_path: str, bottle_spec):
     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
     input_norm = _normalize(bottle_crop)
 
-    # Keep normalization computed for pipeline compatibility and future use.
-    _ = input_norm
-
     edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(bottle_crop)
-    if edge_y_rel is None:
-        raise ProcessingError("Oil level line could not be detected")
+
+    # Fallback path for images where the meniscus edge is weak (e.g. near-full).
+    ref_level = None
+    ref_conf = 0.0
+    ref_meta = {}
+    try:
+        references = _load_references()
+        if len(references) >= 3:
+            results = _find_match(input_norm, references)
+            ref_level, ref_conf = _interpolate(results)
+            ref_level = float(np.clip(ref_level, 0.0, 100.0))
+            ref_meta = {
+                "best_level": float(results[0]["level"]),
+                "best_score": float(results[0]["score"]),
+            }
+    except Exception as exc:
+        logger.warning("Reference fallback unavailable: %s", exc)
 
     # Coordinate system reminder: image origin is top-left, y grows downward.
     top_y = int(by)
     bottom_y = int(by + bh)
-    oil_level_y = int(round(by + (edge_y_rel * bh)))
     denom = float(bottom_y - top_y)
     if denom <= 0:
         raise ProcessingError("Invalid bottle boundaries for oil normalization")
 
-    oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
+    detector_source = None
+    if edge_y_rel is not None:
+        oil_level_y = int(round(by + (edge_y_rel * bh)))
+        oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
+        detector_source = "direct_line"
+        confidence = float(np.clip(edge_conf, 0.0, 0.96))
+    elif ref_level is not None:
+        oil_percentage = float(ref_level)
+        oil_level_y = int(round(bottom_y - ((oil_percentage / 100.0) * denom)))
+        detector_source = "reference_fallback"
+        confidence = float(np.clip(ref_conf * 0.90, 0.0, 0.90))
+        logger.info(
+            "Direct oil line not found; using reference fallback: level=%.1f%% conf=%.2f",
+            oil_percentage, confidence,
+        )
+    else:
+        raise ProcessingError("Oil level line could not be detected and no fallback reference estimate is available")
+
     oil_percentage = float(np.clip(oil_percentage, 0.0, 100.0))
     oil_ratio = oil_percentage / 100.0
     oil_level = int(round(oil_percentage))
-    confidence = float(np.clip(edge_conf, 0.0, 0.96))
 
     # ----------------------------------------------------------------
     # Volume calculation — guard against misconfigured bottle_spec.
@@ -1039,7 +1066,9 @@ def process_bottle_image(image_path: str, bottle_spec):
             "top_y": int(top_y),
             "bottom_y": int(bottom_y),
             "oil_level_y": int(oil_level_y),
+            "source": detector_source,
             "detector": edge_meta,
+            "reference": ref_meta,
         },
         "bottle_bbox": {
             "x": int(bx),
