@@ -241,9 +241,9 @@ def _adaptive_oil_mask(img_bgr):
 def _detect_oil_line_direct(bottle_crop):
     """Detect the oil meniscus directly on the bottle crop.
 
-    Returns (y_relative, confidence) where y_relative is the oil-line Y
-    position as a fraction of the bottle HEIGHT (0.0 top, 1.0 bottom),
-    or (None, 0.0) if no convincing line is found.
+    Returns (y_relative, confidence, meta) where y_relative is the oil-line Y
+    position as a fraction of bottle HEIGHT (0.0 top, 1.0 bottom),
+    or (None, 0.0, {}) if no convincing line is found.
 
     Strategy:
     1. Restrict to body ROI (avoid cap / handle edges).
@@ -254,13 +254,13 @@ def _detect_oil_line_direct(bottle_crop):
     """
     bh_full = bottle_crop.shape[0]
     if bh_full < 80:
-        return None, 0.0
+        return None, 0.0, {}
 
     roi, (rx, ry, rw, rh) = _body_roi(
         bottle_crop, vertical=(0.02, 0.98), horizontal=(0.20, 0.80)
     )
     if rh < 50 or rw < 20:
-        return None, 0.0
+        return None, 0.0, {}
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -274,7 +274,7 @@ def _detect_oil_line_direct(bottle_crop):
         maxLineGap=10,
     )
     if lines is None:
-        return None, 0.0
+        return None, 0.0, {}
 
     # Collect near-horizontal segments and aggregate by Y.
     band_h = 6  # group segments within ±6 pixels
@@ -289,10 +289,10 @@ def _detect_oil_line_direct(bottle_crop):
         buckets.setdefault(key, []).append((y_mid, length))
 
     if not buckets:
-        return None, 0.0
+        return None, 0.0, {}
 
     # Score each bucket by brightness delta (oil darker than air above it).
-    best = None
+    candidates = []
     for key, segs in buckets.items():
         y_mid = int(np.mean([s[0] for s in segs]))
         total_len = sum(s[1] for s in segs)
@@ -309,19 +309,38 @@ def _detect_oil_line_direct(bottle_crop):
         # Oil is golden/yellow → brighter than empty air in LAB L but darker in
         # some scenes. Use absolute delta as the signal.
         score = abs(delta) * (total_len / rw)
+        candidates.append(
+            {"y": y_mid, "score": float(score), "delta": float(delta), "len": int(total_len)}
+        )
 
-        if best is None or score > best["score"]:
-            best = {"y": y_mid, "score": score, "delta": delta, "len": total_len}
+    if not candidates:
+        return None, 0.0, {}
 
-    if best is None or best["score"] < 8.0:
-        return None, 0.0
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    if candidates[0]["score"] < 8.0:
+        return None, 0.0, {}
+
+    # Stabilize Y by weighted average of top nearby candidates.
+    anchor_y = candidates[0]["y"]
+    nearby = [c for c in candidates[:8] if abs(c["y"] - anchor_y) <= 10]
+    if not nearby:
+        nearby = [candidates[0]]
+    weights = np.array([max(1e-6, c["score"]) for c in nearby], dtype=float)
+    ys = np.array([c["y"] for c in nearby], dtype=float)
+    y_stable = float(np.average(ys, weights=weights))
+    best_score = float(candidates[0]["score"])
+    best_len = int(candidates[0]["len"])
 
     # Remap Y from ROI coords to full bottle crop coords.
-    y_full = ry + best["y"]
+    y_full = ry + y_stable
     y_relative = y_full / bh_full
     # Confidence scales with score; cap at 0.85 — edges alone are noisy.
-    conf = min(0.85, 0.35 + best["score"] / 80.0)
-    return float(y_relative), float(conf)
+    conf = min(0.90, 0.35 + best_score / 75.0 + min(0.10, best_len / max(1.0, rw) * 0.10))
+    return float(y_relative), float(conf), {
+        "roi": {"x": int(rx), "y": int(ry), "w": int(rw), "h": int(rh)},
+        "candidate_count": int(len(candidates)),
+        "used_count": int(len(nearby)),
+    }
 
 
 # =====================================================================
@@ -793,37 +812,26 @@ def process_bottle_image(image_path: str, bottle_spec):
     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
     input_norm = _normalize(bottle_crop)
 
-    references = _load_references()
-    if len(references) < 3:
-        raise ProcessingError(f"Need >= 3 references, found {len(references)}")
+    # Keep normalization computed for pipeline compatibility and future use.
+    _ = input_norm
 
-    results = _find_match(input_norm, references)
-    oil_level, confidence = _interpolate(results)
+    edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(bottle_crop)
+    if edge_y_rel is None:
+        raise ProcessingError("Oil level line could not be detected")
 
-    # --- Direct oil-line detection blend ---
-    # Trust the edge-based reading only if it lands within ±15% of the
-    # reference-match reading; otherwise the edge is most likely a label
-    # border and the reference match is more reliable.
-    edge_y_rel, edge_conf = _detect_oil_line_direct(bottle_crop)
-    if edge_y_rel is not None:
-        edge_level = (1.0 - edge_y_rel) * 100.0
-        diff = abs(edge_level - oil_level)
-        if diff <= 15.0 and edge_conf >= 0.45:
-            blend_w = min(0.4, edge_conf * 0.5)
-            oil_level = oil_level * (1 - blend_w) + edge_level * blend_w
-            confidence = min(0.96, confidence + 0.04)
-            logger.info(
-                "Edge-blend: edge=%.1f%% ref=%.1f%% diff=%.1f weight=%.2f",
-                edge_level, results[0]["level"], diff, blend_w,
-            )
-        else:
-            logger.info(
-                "Edge ignored: edge=%.1f%% ref=%.1f%% diff=%.1f conf=%.2f",
-                edge_level, results[0]["level"], diff, edge_conf,
-            )
+    # Coordinate system reminder: image origin is top-left, y grows downward.
+    top_y = int(by)
+    bottom_y = int(by + bh)
+    oil_level_y = int(round(by + (edge_y_rel * bh)))
+    denom = float(bottom_y - top_y)
+    if denom <= 0:
+        raise ProcessingError("Invalid bottle boundaries for oil normalization")
 
-    oil_level = int(round(oil_level))
-    oil_ratio = oil_level / 100.0
+    oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
+    oil_percentage = float(np.clip(oil_percentage, 0.0, 100.0))
+    oil_ratio = oil_percentage / 100.0
+    oil_level = int(round(oil_percentage))
+    confidence = float(np.clip(edge_conf, 0.0, 0.96))
 
     total = float(bottle_spec.total_volume_liters)
     remaining = oil_ratio * total
@@ -834,13 +842,19 @@ def process_bottle_image(image_path: str, bottle_spec):
 
     logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
 
-    # ---- MINIMAL OVERLAY: Just the red oil line + percentage label ----
+    # ---- DEBUG OVERLAY: top, bottom and detected oil level lines ----
     img_h, img_w = original.shape[:2]
     overlay = original.copy()
 
-    oil_y = by + int(bh * (1 - oil_ratio))
+    oil_y = oil_level_y
+    top_line_y = top_y
+    bottom_line_y = bottom_y
 
-    # Red oil level line across the entire image
+    # Blue top boundary line
+    cv2.line(overlay, (0, top_line_y), (img_w, top_line_y), (255, 0, 0), 2)
+    # Yellow bottom boundary line
+    cv2.line(overlay, (0, bottom_line_y), (img_w, bottom_line_y), (0, 255, 255), 2)
+    # Red oil level line
     cv2.line(overlay, (0, oil_y), (img_w, oil_y), (0, 0, 255), 3)
 
     # Oil percentage label above the line
@@ -878,6 +892,12 @@ def process_bottle_image(image_path: str, bottle_spec):
         "consumed_cups": consumed_cups,
         "confidence_score": round(confidence, 2),
         "processing_time_ms": processing_time_ms,
+        "oil_line_debug": {
+            "top_y": int(top_y),
+            "bottom_y": int(bottom_y),
+            "oil_level_y": int(oil_level_y),
+            "detector": edge_meta,
+        },
         "bottle_bbox": {
             "x": int(bx),
             "y": int(by),
