@@ -7,3 +7,5 @@ media/
 test_images/
 .claude/
 .codex
+test_image.py
+test_oil.py
