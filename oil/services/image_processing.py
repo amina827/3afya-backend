@@ -802,6 +802,112 @@ def _interpolate(results):
 # Main processing
 # =====================================================================
 
+# def process_bottle_image(image_path: str, bottle_spec):
+#     start = time.time()
+#     logger.info("Processing: %s", image_path)
+
+#     image = _load_image(image_path)
+#     original = image.copy()
+
+#     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
+#     input_norm = _normalize(bottle_crop)
+
+#     # Keep normalization computed for pipeline compatibility and future use.
+#     _ = input_norm
+
+#     edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(bottle_crop)
+#     if edge_y_rel is None:
+#         raise ProcessingError("Oil level line could not be detected")
+
+#     # Coordinate system reminder: image origin is top-left, y grows downward.
+#     top_y = int(by)
+#     bottom_y = int(by + bh)
+#     oil_level_y = int(round(by + (edge_y_rel * bh)))
+#     denom = float(bottom_y - top_y)
+#     if denom <= 0:
+#         raise ProcessingError("Invalid bottle boundaries for oil normalization")
+
+#     oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
+#     oil_percentage = float(np.clip(oil_percentage, 0.0, 100.0))
+#     oil_ratio = oil_percentage / 100.0
+#     oil_level = int(round(oil_percentage))
+#     confidence = float(np.clip(edge_conf, 0.0, 0.96))
+
+#     total = float(bottle_spec.total_volume_liters)
+#     remaining = oil_ratio * total
+#     consumed = total - remaining
+#     cup = float(bottle_spec.cup_conversion_ratio)
+#     remaining_cups = remaining / cup if cup > 0 else 0
+#     consumed_cups = consumed / cup if cup > 0 else 0
+
+#     logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
+
+#     # ---- DEBUG OVERLAY: top, bottom and detected oil level lines ----
+#     img_h, img_w = original.shape[:2]
+#     overlay = original.copy()
+
+#     oil_y = oil_level_y
+#     top_line_y = top_y
+#     bottom_line_y = bottom_y
+
+#     # Blue top boundary line
+#     cv2.line(overlay, (0, top_line_y), (img_w, top_line_y), (255, 0, 0), 2)
+#     # Yellow bottom boundary line
+#     cv2.line(overlay, (0, bottom_line_y), (img_w, bottom_line_y), (0, 255, 255), 2)
+#     # Red oil level line
+#     cv2.line(overlay, (0, oil_y), (img_w, oil_y), (0, 0, 255), 3)
+
+#     # Oil percentage label above the line
+#     fs = max(0.6, min(1.6, img_w / 400.0))
+#     th = max(2, int(fs * 2))
+#     label = f"{oil_level}%"
+#     (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+
+#     # Position label centered horizontally on the bottle, above the line
+#     label_x = max(10, min(img_w - tw - 10, bx + bw // 2 - tw // 2))
+#     label_y = max(th_text + 10, oil_y - 10)
+
+#     # White outline for readability
+#     cv2.putText(overlay, label, (label_x, label_y),
+#                 cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th + 3, cv2.LINE_AA)
+#     cv2.putText(overlay, label, (label_x, label_y),
+#                 cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), th, cv2.LINE_AA)
+
+#     processed_dir = Path(settings.MEDIA_ROOT) / "scans" / "processed"
+#     _ensure_dir(processed_dir)
+#     fname = f"processed_{uuid.uuid4().hex}.jpg"
+#     cv2.imwrite(str(processed_dir / fname), overlay)
+
+#     processing_time_ms = int((time.time() - start) * 1000)
+#     logger.info("Done in %dms", processing_time_ms)
+
+#     return {
+#         "processed_path": f"scans/processed/{fname}",
+#         "oil_height_pixels": float(bh * oil_ratio),
+#         "bottle_height_pixels": float(bh),
+#         "oil_ratio": oil_ratio,
+#         "remaining_volume_liters": remaining,
+#         "consumed_volume_liters": consumed,
+#         "remaining_cups": remaining_cups,
+#         "consumed_cups": consumed_cups,
+#         "confidence_score": round(confidence, 2),
+#         "processing_time_ms": processing_time_ms,
+#         "oil_line_debug": {
+#             "top_y": int(top_y),
+#             "bottom_y": int(bottom_y),
+#             "oil_level_y": int(oil_level_y),
+#             "detector": edge_meta,
+#         },
+#         "bottle_bbox": {
+#             "x": int(bx),
+#             "y": int(by),
+#             "w": int(bw),
+#             "h": int(bh),
+#             "image_w": int(img_w),
+#             "image_h": int(img_h),
+#         },
+#     }
+
 def process_bottle_image(image_path: str, bottle_spec):
     start = time.time()
     logger.info("Processing: %s", image_path)
@@ -833,12 +939,49 @@ def process_bottle_image(image_path: str, bottle_spec):
     oil_level = int(round(oil_percentage))
     confidence = float(np.clip(edge_conf, 0.0, 0.96))
 
+    # ----------------------------------------------------------------
+    # Volume calculation — guard against misconfigured bottle_spec.
+    # The Afia 1.5 L bottle is the only supported model; warn loudly
+    # if total_volume_liters looks wrong so it is caught during QA.
+    # ----------------------------------------------------------------
     total = float(bottle_spec.total_volume_liters)
+    EXPECTED_TOTAL = 1.5          # litres – Afia 1.5 L bottle
+    TOLERANCE      = 0.05         # ±5%
+
+    if abs(total - EXPECTED_TOTAL) / EXPECTED_TOTAL > TOLERANCE:
+        logger.warning(
+            "bottle_spec.total_volume_liters=%.3f differs from expected %.3f "
+            "(id=%s, name=%s). Overriding with %.3f for this scan. "
+            "Please fix the BottleSpecification record in the Django admin.",
+            total, EXPECTED_TOTAL,
+            getattr(bottle_spec, "pk", "?"),
+            getattr(bottle_spec, "name", "?"),
+            EXPECTED_TOTAL,
+        )
+        total = EXPECTED_TOTAL
+
     remaining = oil_ratio * total
-    consumed = total - remaining
+    consumed  = total - remaining
+
     cup = float(bottle_spec.cup_conversion_ratio)
-    remaining_cups = remaining / cup if cup > 0 else 0
-    consumed_cups = consumed / cup if cup > 0 else 0
+    EXPECTED_CUP = 0.200          # 200 ml per cup
+    if cup <= 0 or abs(cup - EXPECTED_CUP) / EXPECTED_CUP > 0.20:
+        logger.warning(
+            "bottle_spec.cup_conversion_ratio=%.4f looks wrong (expected ~%.3f). "
+            "Overriding. Fix the BottleSpecification record in Django admin.",
+            cup, EXPECTED_CUP,
+        )
+        cup = EXPECTED_CUP
+
+    remaining_cups = remaining / cup
+    consumed_cups  = consumed  / cup
+
+    # Plausibility cross-check — log if numbers are still unreasonable.
+    if remaining > total * 1.01:
+        logger.error(
+            "remaining_volume (%.3f L) > total (%.3f L) — check oil_ratio=%.3f",
+            remaining, total, oil_ratio,
+        )
 
     logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
 
@@ -886,10 +1029,10 @@ def process_bottle_image(image_path: str, bottle_spec):
         "oil_height_pixels": float(bh * oil_ratio),
         "bottle_height_pixels": float(bh),
         "oil_ratio": oil_ratio,
-        "remaining_volume_liters": remaining,
-        "consumed_volume_liters": consumed,
-        "remaining_cups": remaining_cups,
-        "consumed_cups": consumed_cups,
+        "remaining_volume_liters": round(remaining, 3),
+        "consumed_volume_liters": round(consumed, 3),
+        "remaining_cups": round(remaining_cups, 2),
+        "consumed_cups": round(consumed_cups, 2),
         "confidence_score": round(confidence, 2),
         "processing_time_ms": processing_time_ms,
         "oil_line_debug": {

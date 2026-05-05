@@ -30,12 +30,15 @@ class ImageUploadSerializer(serializers.Serializer):
 
 
 class ScanResultSerializer(serializers.ModelSerializer):
-    processed_image_url = serializers.SerializerMethodField()
-    original_image_url = serializers.SerializerMethodField()
-    consumed_cups_range = serializers.SerializerMethodField()
-    remaining_liters_estimate = serializers.SerializerMethodField()
-    oil_percentage = serializers.SerializerMethodField()
+    processed_image_url        = serializers.SerializerMethodField()
+    original_image_url         = serializers.SerializerMethodField()
+    consumed_cups_range        = serializers.SerializerMethodField()
+    remaining_liters_estimate  = serializers.SerializerMethodField()
+    oil_percentage             = serializers.SerializerMethodField()
     oil_line_position_from_top = serializers.SerializerMethodField()
+    # Fixed: rounded via method to avoid floating-point noise
+    consumed_volume_liters     = serializers.SerializerMethodField()
+    consumed_cups              = serializers.SerializerMethodField()
 
     class Meta:
         model = ScanImage
@@ -73,24 +76,34 @@ class ScanResultSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(obj.processed_image.url)
         return obj.processed_image.url
 
+    def get_consumed_volume_liters(self, obj):
+        if obj.consumed_volume_liters is None:
+            return None
+        return round(float(obj.consumed_volume_liters), 3)
+
+    def get_consumed_cups(self, obj):
+        if obj.consumed_cups is None:
+            return None
+        return round(float(obj.consumed_cups), 2)
+
     def get_consumed_cups_range(self, obj):
         if obj.consumed_cups is None:
             return None
         confidence = obj.confidence_score or 0.0
         margin = max(0.2, (1 - confidence) * 1.0)
-        low = max(0.0, obj.consumed_cups - margin)
-        high = obj.consumed_cups + margin
-        return [round(low, 2), round(high, 2)]
+        low  = max(0.0, round(float(obj.consumed_cups) - margin, 2))
+        high = round(float(obj.consumed_cups) + margin, 2)
+        return [low, high]
 
     def get_remaining_liters_estimate(self, obj):
         if obj.remaining_volume_liters is None:
             return None
-        return round(obj.remaining_volume_liters, 3)
+        return round(float(obj.remaining_volume_liters), 3)
 
     def get_oil_percentage(self, obj):
         if obj.oil_ratio is None:
             return None
-        return round(obj.oil_ratio * 100.0, 2)
+        return round(float(obj.oil_ratio) * 100.0, 2)
 
     def get_oil_line_position_from_top(self, obj):
         """Normalized line position in bottle space (0.0=top, 1.0=bottom)."""
@@ -112,7 +125,7 @@ class TargetLevelSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         cups = attrs.get("target_cups")
-        ml = attrs.get("target_volume_ml")
+        ml   = attrs.get("target_volume_ml")
         if cups is None and ml is None:
             raise serializers.ValidationError(
                 "Provide either target_cups or target_volume_ml."
@@ -125,13 +138,13 @@ class TargetLevelSerializer(serializers.Serializer):
 
 
 class TargetResponseSerializer(serializers.ModelSerializer):
-    target_image_url = serializers.SerializerMethodField()
-    target_volume_ml = serializers.SerializerMethodField()
-    level_position_percent = serializers.SerializerMethodField()
-    cup_ml = serializers.SerializerMethodField()
-    target_volume_liters = serializers.SerializerMethodField()
-    target_ratio = serializers.SerializerMethodField()
-    target_percentage = serializers.SerializerMethodField()
+    target_image_url            = serializers.SerializerMethodField()
+    target_volume_ml            = serializers.SerializerMethodField()
+    level_position_percent      = serializers.SerializerMethodField()
+    cup_ml                      = serializers.SerializerMethodField()
+    target_volume_liters        = serializers.SerializerMethodField()
+    target_ratio                = serializers.SerializerMethodField()
+    target_percentage           = serializers.SerializerMethodField()
     target_line_position_from_top = serializers.SerializerMethodField()
 
     class Meta:
@@ -178,11 +191,11 @@ class TargetResponseSerializer(serializers.ModelSerializer):
 
     def get_target_ratio(self, obj):
         bottle = obj.scan.bottle
-        total = float(bottle.total_volume_liters)
+        total  = float(bottle.total_volume_liters)
         if total <= 0:
             return 0.0
         liters = float(obj.target_cups) * float(bottle.cup_conversion_ratio)
-        ratio = max(0.0, min(1.0, liters / total))
+        ratio  = max(0.0, min(1.0, liters / total))
         return round(ratio, 4)
 
     def get_target_percentage(self, obj):
@@ -196,21 +209,21 @@ class TargetResponseSerializer(serializers.ModelSerializer):
 
 
 class SliderStepSerializer(serializers.Serializer):
-    index = serializers.IntegerField()
-    cups = serializers.FloatField()
-    volume_ml = serializers.FloatField()
+    index            = serializers.IntegerField()
+    cups             = serializers.FloatField()
+    volume_ml        = serializers.FloatField()
     position_percent = serializers.FloatField()
-    label = serializers.CharField()
+    label            = serializers.CharField()
 
 
 class SliderConfigSerializer(serializers.Serializer):
-    bottle_id = serializers.CharField()
-    bottle_name = serializers.CharField()
+    bottle_id      = serializers.CharField()
+    bottle_name    = serializers.CharField()
     total_volume_ml = serializers.FloatField()
-    cup_ml = serializers.FloatField()
-    step_ml = serializers.FloatField()
-    max_cups = serializers.FloatField()
-    steps = SliderStepSerializer(many=True)
+    cup_ml         = serializers.FloatField()
+    step_ml        = serializers.FloatField()
+    max_cups       = serializers.FloatField()
+    steps          = SliderStepSerializer(many=True)
 
 
 class FeedbackSerializer(serializers.ModelSerializer):
@@ -221,10 +234,10 @@ class FeedbackSerializer(serializers.ModelSerializer):
 
 
 class TrainingImageUploadSerializer(serializers.Serializer):
-    bottle_id = serializers.SlugField()
-    image = serializers.ImageField()
+    bottle_id             = serializers.SlugField()
+    image                 = serializers.ImageField()
     actual_oil_percentage = serializers.FloatField(min_value=0, max_value=100)
-    lighting = serializers.ChoiceField(
+    lighting              = serializers.ChoiceField(
         choices=["daylight", "fluorescent", "dim", "direct_sun", "mixed"],
         default="daylight",
     )
@@ -233,7 +246,7 @@ class TrainingImageUploadSerializer(serializers.Serializer):
         default="kitchen",
     )
     camera_info = serializers.CharField(required=False, allow_blank=True, default="")
-    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    notes       = serializers.CharField(required=False, allow_blank=True, default="")
     uploaded_by = serializers.CharField(required=False, allow_blank=True, default="")
 
 
@@ -259,11 +272,11 @@ class TrainingImageResponseSerializer(serializers.ModelSerializer):
 
 
 class TrainingStatsSerializer(serializers.Serializer):
-    total_images = serializers.IntegerField()
+    total_images    = serializers.IntegerField()
     verified_images = serializers.IntegerField()
-    by_lighting = serializers.DictField()
-    by_environment = serializers.DictField()
-    by_bottle = serializers.ListField()
+    by_lighting     = serializers.DictField()
+    by_environment  = serializers.DictField()
+    by_bottle       = serializers.ListField()
 
 
 # =====================================================================
@@ -302,8 +315,8 @@ class QRCodeSerializer(serializers.ModelSerializer):
 
 class VerifyQRSerializer(serializers.Serializer):
     """Input for QR vs Label verification."""
-    qr_data = serializers.CharField(help_text="The scanned QR code content")
-    scanned_label_name = serializers.CharField(
+    qr_data             = serializers.CharField(help_text="The scanned QR code content")
+    scanned_label_name  = serializers.CharField(
         required=False, allow_blank=True,
         help_text="What label the user sees on the bottle (optional)",
     )
@@ -315,7 +328,7 @@ class VerifyQRSerializer(serializers.Serializer):
 
 class VerifyResultSerializer(serializers.Serializer):
     """Output of QR vs Label verification."""
-    result = serializers.ChoiceField(choices=VerificationLog.RESULT_CHOICES)
-    message = serializers.CharField()
-    qr_code = QRCodeSerializer(allow_null=True)
+    result         = serializers.ChoiceField(choices=VerificationLog.RESULT_CHOICES)
+    message        = serializers.CharField()
+    qr_code        = QRCodeSerializer(allow_null=True)
     expected_label = LabelSerializer(allow_null=True)
