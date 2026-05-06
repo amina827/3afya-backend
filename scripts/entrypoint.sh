@@ -5,24 +5,21 @@ echo "==> Running database migrations..."
 python manage.py migrate --noinput
 
 echo "==> Ensuring Django superuser exists..."
-DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}" \
-DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-bdccoworking@gmail.com}" \
-DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-3afya@Admin2026!}" \
-python manage.py shell -c "
+python manage.py shell << 'EOF'
 import os
 from django.contrib.auth import get_user_model
 User = get_user_model()
-u = os.environ['DJANGO_SUPERUSER_USERNAME']
-e = os.environ['DJANGO_SUPERUSER_EMAIL']
-p = os.environ['DJANGO_SUPERUSER_PASSWORD']
-obj, created = User.objects.get_or_create(username=u, defaults={'email': e, 'is_staff': True, 'is_superuser': True})
-obj.email = e
+username = os.environ.get("DJANGO_SUPERUSER_USERNAME", "admin")
+email = os.environ.get("DJANGO_SUPERUSER_EMAIL", "bdccoworking@gmail.com")
+password = os.environ.get("DJANGO_SUPERUSER_PASSWORD", "3afya@Admin2026!")
+obj, created = User.objects.get_or_create(username=username)
+obj.email = email
 obj.is_staff = True
 obj.is_superuser = True
-obj.set_password(p)
+obj.set_password(password)
 obj.save()
-print(('created' if created else 'updated') + ' superuser: ' + u)
-"
+print(("Created" if created else "Updated") + " superuser:", username)
+EOF
 
 echo "==> Collecting static files..."
 python manage.py collectstatic --noinput
