@@ -24,9 +24,9 @@ EOF
 echo "==> Collecting static files..."
 python manage.py collectstatic --noinput
 
-echo "==> Starting gunicorn on port ${PORT:-8000}..."
+echo "==> Starting gunicorn on port ${PORT:-8080}..."
 exec gunicorn core.wsgi:application \
-    --bind 0.0.0.0:${PORT:-8000} \
+    --bind 0.0.0.0:${PORT:-8080} \
     --workers 3 \
     --timeout 120 \
     --access-logfile - \

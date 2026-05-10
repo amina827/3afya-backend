@@ -2,7 +2,7 @@ FROM python:3.9-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8080
 
 WORKDIR /app
 
@@ -24,6 +24,6 @@ COPY . .
 RUN sed -i 's/\r$//' scripts/entrypoint.sh \
     && chmod +x scripts/entrypoint.sh
 
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["sh", "scripts/entrypoint.sh"]
