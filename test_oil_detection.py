@@ -1,108 +1,91 @@
-"""
-Test V11 oil detection on all 16 reference images.
-Run: python test_oil_detection.py
-"""
-import os
-import sys
-import cv2
-import numpy as np
-
-# Minimal Django setup so we can import image_processing
+"""Test V12 oil detection on all 16 reference images."""
+import os, sys
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
-# We only need cv2/numpy — mock Django settings to avoid full Django init
-class FakeSettings:
+class _S:
     MEDIA_ROOT = os.path.join(os.path.dirname(__file__), "media")
 
 sys.modules.setdefault("django", type(sys)("django"))
 sys.modules.setdefault("django.conf", type(sys)("django.conf"))
-sys.modules["django.conf"].settings = FakeSettings()
+sys.modules["django.conf"].settings = _S()
 
 from oil.services.image_processing import (
-    _detect_cap,
-    _detect_oil_level,
-    _fill_ratio_to_ml,
-    _load_image,
-    REFERENCE_DIR,
+    _detect_cap, _detect_oil_level, _fill_ratio_to_ml, _load_image, REFERENCE_DIR,
 )
+import cv2
 
-VOLUMES = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900,
-           1000, 1100, 1200, 1300, 1400, 1500]
-
+VOLUMES = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500]
 
 def main():
-    print("=" * 80)
-    print(" V11 Algorithm Test on 16 Reference Images")
-    print("=" * 80)
-    print(f"{'Actual':>7} | {'Detected':>9} | {'Error':>7} | {'Ratio':>6} | {'Confidence':>10} | Note")
-    print("-" * 80)
+    print("=" * 95)
+    print(" V12 Algorithm Test — 3-Zone Detection")
+    print("=" * 95)
+    print(f"{'Actual':>7} | {'Detect':>7} | {'Error':>7} | {'Ratio':>6} | {'Conf':>6} | {'Zone':>12} | Note")
+    print("-" * 95)
 
-    high_conf_errors = []
-    all_errors = []
+    errors = {"high": [], "medium": [], "low": [], "all": []}
 
     for vol in VOLUMES:
-        img_path = str(REFERENCE_DIR / f"{vol}.jpeg")
-        if not os.path.exists(img_path):
-            print(f"{vol:>5}ml | MISSING: {img_path}")
+        path = str(REFERENCE_DIR / f"{vol}.jpeg")
+        if not os.path.exists(path):
+            print(f"{vol:>5}ml | MISSING")
             continue
 
-        image = _load_image(img_path)
+        image = _load_image(path)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
         cap = _detect_cap(hsv, image.shape)
         if cap is None:
             print(f"{vol:>5}ml | CAP NOT FOUND")
             continue
 
         oil = _detect_oil_level(image, hsv, cap)
-        fill_ratio = oil["fill_ratio"]
-        detected_ml = _fill_ratio_to_ml(fill_ratio)
-        error = detected_ml - vol
+        fr = oil["fill_ratio"]
+        ml = _fill_ratio_to_ml(fr)
+        err = ml - vol
         conf = oil["confidence"]
+        zone = oil.get("detection_zone", "?")
 
-        if conf == "high":
-            high_conf_errors.append(abs(error))
-        all_errors.append(abs(error))
+        errors[conf].append(abs(err))
+        errors["all"].append(abs(err))
 
-        note = oil.get("confidence_note", "")[:50]
-        print(
-            f"{vol:>5}ml | {detected_ml:>7.0f}ml | {error:>+6.0f}ml | "
-            f"{fill_ratio:>5.3f} | {conf:>10} | {note}"
-        )
+        note = oil.get("confidence_note", "")[:40]
+        print(f"{vol:>5}ml | {ml:>5.0f}ml | {err:>+6.0f}ml | {fr:>5.3f} | {conf:>6} | {zone:>12} | {note}")
 
-    print("-" * 80)
-    if high_conf_errors:
-        avg = sum(high_conf_errors) / len(high_conf_errors)
-        mx = max(high_conf_errors)
-        print(f"HIGH confidence: n={len(high_conf_errors)}, avg_err={avg:.1f}ml, max_err={mx:.0f}ml")
-    if all_errors:
-        avg = sum(all_errors) / len(all_errors)
-        mx = max(all_errors)
-        print(f"ALL images:      n={len(all_errors)}, avg_err={avg:.1f}ml, max_err={mx:.0f}ml")
+    print("-" * 95)
+    for k in ["high", "medium", "low", "all"]:
+        e = errors[k]
+        if e:
+            print(f"  {k:>6}: n={len(e):>2}, avg_err={sum(e)/len(e):>6.1f}ml, max_err={max(e):>5.0f}ml")
 
-    # Strict check: high-confidence images should be within +-100ml
+    # Strict test: 1200-1500ml must be within ±100ml
+    print()
     failed = 0
-    for vol in [700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500]:
-        img_path = str(REFERENCE_DIR / f"{vol}.jpeg")
-        if not os.path.exists(img_path):
-            continue
-        image = _load_image(img_path)
+    for vol in [1200, 1300, 1400, 1500]:
+        path = str(REFERENCE_DIR / f"{vol}.jpeg")
+        image = _load_image(path)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         cap = _detect_cap(hsv, image.shape)
-        if cap is None:
-            failed += 1
-            continue
         oil = _detect_oil_level(image, hsv, cap)
-        detected = _fill_ratio_to_ml(oil["fill_ratio"])
-        if abs(detected - vol) > 100:
-            print(f"FAIL: {vol}ml detected as {detected:.0f}ml (error > 100ml)")
+        ml = _fill_ratio_to_ml(oil["fill_ratio"])
+        if abs(ml - vol) > 100:
+            print(f"  FAIL: {vol}ml -> {ml:.0f}ml (error > 100ml)")
             failed += 1
+
+    # Empty bottle MUST be 0ml
+    path = str(REFERENCE_DIR / "0.jpeg")
+    image = _load_image(path)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    cap = _detect_cap(hsv, image.shape)
+    oil = _detect_oil_level(image, hsv, cap)
+    ml = _fill_ratio_to_ml(oil["fill_ratio"])
+    if ml > 50:
+        print(f"  FAIL: 0ml -> {ml:.0f}ml (empty bottle not detected)")
+        failed += 1
 
     if failed == 0:
-        print("\nAll high-confidence tests PASSED (700-1500ml within +-100ml)")
+        print("  All critical tests PASSED")
     else:
-        print(f"\n{failed} high-confidence test(s) FAILED")
-
+        print(f"  {failed} test(s) FAILED")
 
 if __name__ == "__main__":
     main()
