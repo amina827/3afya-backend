@@ -212,7 +212,12 @@ def _body_roi(bottle_img, vertical=(0.05, 0.97), horizontal=(0.15, 0.85)):
 # =====================================================================
 
 def _detect_label_zone(bottle_crop):
-    """Detect the Afia 1.5L label region using its white body + green decorations.
+    """Detect the Afia 1.5L label region using green + red anchor colors.
+
+    Strategy: Use green (V-shape) and red (heart, accents) as anchor colors
+    that are unique to the label. White is NOT used as a primary signal
+    because the transparent empty bottle also appears white/light. Instead,
+    the label zone is defined by the bounding box of green+red regions.
 
     Returns a dict with fractional bounds and a binary mask:
         {"top": float, "bottom": float, "left": float, "right": float,
@@ -222,28 +227,24 @@ def _detect_label_zone(bottle_crop):
     h, w = bottle_crop.shape[:2]
     hsv = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2HSV)
 
-    # White detection: low saturation, high value (main label body)
-    white_mask = cv2.inRange(hsv,
-                             np.array([0, 0, 170], dtype=np.uint8),
-                             np.array([180, 50, 255], dtype=np.uint8))
-
-    # Green detection: the V-shape decorations on the Afia label
+    # Green detection: the V-shape decorations on the Afia label (anchor)
     green_mask = cv2.inRange(hsv,
                              np.array([40, 60, 40], dtype=np.uint8),
                              np.array([85, 255, 255], dtype=np.uint8))
 
-    # Red label accents
+    # Red label accents: heart logo, "Cholesterol Free" badge (anchor)
     red1 = cv2.inRange(hsv, np.array([0, 80, 60]), np.array([8, 255, 255]))
     red2 = cv2.inRange(hsv, np.array([168, 80, 60]), np.array([180, 255, 255]))
 
-    combined = white_mask | green_mask | red1 | red2
+    # Anchor mask: only the distinctive label colors (NOT white)
+    anchor_mask = green_mask | red1 | red2
 
-    # Morphological close to merge nearby regions into one label blob
-    kernel = np.ones((11, 11), np.uint8)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=3)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Morphological close to merge green+red into one blob
+    kernel = np.ones((9, 9), np.uint8)
+    anchor_mask = cv2.morphologyEx(anchor_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    anchor_mask = cv2.morphologyEx(anchor_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
+    contours, _ = cv2.findContours(anchor_mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
     # Calibrated fallback for Afia 1.5L
@@ -253,7 +254,6 @@ def _detect_label_zone(bottle_crop):
         "mask": np.zeros((h, w), dtype=np.uint8),
         "detected": False,
     }
-    # Fill fallback mask
     ft, fb = int(h * 0.32), int(h * 0.72)
     fl, fr = int(w * 0.15), int(w * 0.85)
     fallback["mask"][ft:fb, fl:fr] = 255
@@ -261,18 +261,18 @@ def _detect_label_zone(bottle_crop):
     if not contours:
         return fallback
 
-    # Find the largest contour that looks like a label
-    # (must be a reasonable fraction of bottle area)
-    min_area = h * w * 0.05
+    # Find the largest contour that looks like a label anchor region
+    min_area = h * w * 0.02  # green+red are smaller than full label
+    max_area = h * w * 0.55  # label can't cover more than 55% of bottle
     label_contour = None
     for c in sorted(contours, key=cv2.contourArea, reverse=True):
         area = cv2.contourArea(c)
+        if area > max_area:
+            continue  # too large — probably merged with background
         if area < min_area:
             break
         cx, cy, cw, ch = cv2.boundingRect(c)
-        aspect = ch / max(1, cw)
-        # Label is roughly rectangular, wider than tall or roughly square
-        if 0.3 < aspect < 3.0 and cw > w * 0.2:
+        if cw > w * 0.15:
             label_contour = c
             break
 
@@ -281,21 +281,33 @@ def _detect_label_zone(bottle_crop):
 
     lx, ly, lw, lh = cv2.boundingRect(label_contour)
 
-    # Sanity: label should be in the middle portion of the bottle
-    label_center_y = (ly + lh / 2) / h
+    # The green+red anchor typically covers the inner part of the label.
+    # Expand vertically by ~15% to include white areas above/below.
+    expand_v = int(lh * 0.15)
+    ly_exp = max(0, ly - expand_v)
+    lh_exp = min(h, ly + lh + expand_v) - ly_exp
+
+    # Expand horizontally to full bottle width (label spans the body)
+    lx_exp = max(0, int(w * 0.10))
+    lw_exp = int(w * 0.80)
+
+    # Sanity: label center should be in the middle portion of the bottle
+    label_center_y = (ly_exp + lh_exp / 2) / h
     if label_center_y < 0.15 or label_center_y > 0.85:
         return fallback
 
-    # Build a filled mask from the contour bounding rect (more stable than
-    # the irregular contour shape for masking purposes)
+    # Sanity: label should not cover more than 60% of bottle height
+    if lh_exp / h > 0.60:
+        return fallback
+
     label_mask = np.zeros((h, w), dtype=np.uint8)
-    label_mask[ly:ly + lh, lx:lx + lw] = 255
+    label_mask[ly_exp:ly_exp + lh_exp, lx_exp:lx_exp + lw_exp] = 255
 
     return {
-        "top": ly / h,
-        "bottom": (ly + lh) / h,
-        "left": lx / w,
-        "right": (lx + lw) / w,
+        "top": ly_exp / h,
+        "bottom": (ly_exp + lh_exp) / h,
+        "left": lx_exp / w,
+        "right": (lx_exp + lw_exp) / w,
         "mask": label_mask,
         "detected": True,
     }
