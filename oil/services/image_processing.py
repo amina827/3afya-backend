@@ -207,11 +207,109 @@ def _body_roi(bottle_img, vertical=(0.05, 0.97), horizontal=(0.15, 0.85)):
     return bottle_img[y1:y2, x1:x2], (x1, y1, x2 - x1, y2 - y1)
 
 
-def _adaptive_oil_mask(img_bgr):
+# =====================================================================
+# STEP 1.55: Label zone detection
+# =====================================================================
+
+def _detect_label_zone(bottle_crop):
+    """Detect the Afia 1.5L label region using its white body + green decorations.
+
+    Returns a dict with fractional bounds and a binary mask:
+        {"top": float, "bottom": float, "left": float, "right": float,
+         "mask": np.ndarray (H x W, uint8 0/255), "detected": bool}
+    Falls back to calibrated constants if detection fails.
+    """
+    h, w = bottle_crop.shape[:2]
+    hsv = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2HSV)
+
+    # White detection: low saturation, high value (main label body)
+    white_mask = cv2.inRange(hsv,
+                             np.array([0, 0, 170], dtype=np.uint8),
+                             np.array([180, 50, 255], dtype=np.uint8))
+
+    # Green detection: the V-shape decorations on the Afia label
+    green_mask = cv2.inRange(hsv,
+                             np.array([40, 60, 40], dtype=np.uint8),
+                             np.array([85, 255, 255], dtype=np.uint8))
+
+    # Red label accents
+    red1 = cv2.inRange(hsv, np.array([0, 80, 60]), np.array([8, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([168, 80, 60]), np.array([180, 255, 255]))
+
+    combined = white_mask | green_mask | red1 | red2
+
+    # Morphological close to merge nearby regions into one label blob
+    kernel = np.ones((11, 11), np.uint8)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=3)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    # Calibrated fallback for Afia 1.5L
+    fallback = {
+        "top": 0.32, "bottom": 0.72,
+        "left": 0.15, "right": 0.85,
+        "mask": np.zeros((h, w), dtype=np.uint8),
+        "detected": False,
+    }
+    # Fill fallback mask
+    ft, fb = int(h * 0.32), int(h * 0.72)
+    fl, fr = int(w * 0.15), int(w * 0.85)
+    fallback["mask"][ft:fb, fl:fr] = 255
+
+    if not contours:
+        return fallback
+
+    # Find the largest contour that looks like a label
+    # (must be a reasonable fraction of bottle area)
+    min_area = h * w * 0.05
+    label_contour = None
+    for c in sorted(contours, key=cv2.contourArea, reverse=True):
+        area = cv2.contourArea(c)
+        if area < min_area:
+            break
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        aspect = ch / max(1, cw)
+        # Label is roughly rectangular, wider than tall or roughly square
+        if 0.3 < aspect < 3.0 and cw > w * 0.2:
+            label_contour = c
+            break
+
+    if label_contour is None:
+        return fallback
+
+    lx, ly, lw, lh = cv2.boundingRect(label_contour)
+
+    # Sanity: label should be in the middle portion of the bottle
+    label_center_y = (ly + lh / 2) / h
+    if label_center_y < 0.15 or label_center_y > 0.85:
+        return fallback
+
+    # Build a filled mask from the contour bounding rect (more stable than
+    # the irregular contour shape for masking purposes)
+    label_mask = np.zeros((h, w), dtype=np.uint8)
+    label_mask[ly:ly + lh, lx:lx + lw] = 255
+
+    return {
+        "top": ly / h,
+        "bottom": (ly + lh) / h,
+        "left": lx / w,
+        "right": (lx + lw) / w,
+        "mask": label_mask,
+        "detected": True,
+    }
+
+
+def _adaptive_oil_mask(img_bgr, label_mask=None):
     """Build an HSV mask for oil that adapts to the image's own color cast.
 
     Falls back to the calibrated static range when the adaptive window
     would shift outside the plausible golden/yellow band [5, 45].
+
+    When *label_mask* is provided (uint8 H x W, 255=label), those pixels
+    are excluded and a local-variance texture filter suppresses label
+    text / graphics (which have high spatial variance vs smooth oil).
     """
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     # Sample only somewhat-saturated pixels to avoid a hue mean dragged
@@ -231,26 +329,48 @@ def _adaptive_oil_mask(img_bgr):
 
     # Union with calibrated static mask so we never lose obvious oil.
     static = cv2.inRange(hsv, np.array([10, 25, 25]), np.array([40, 255, 255]))
-    return mask | static
+    mask = mask | static
+
+    if label_mask is not None:
+        # Ensure label_mask matches dimensions
+        if label_mask.shape[:2] == mask.shape[:2]:
+            # Exclude label pixels
+            mask = mask & cv2.bitwise_not(label_mask)
+
+            # Texture filter: label text/graphics have high local variance,
+            # oil is smooth and uniform. Suppress high-variance pixels.
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            mean = cv2.blur(gray, (11, 11))
+            sq_mean = cv2.blur(gray * gray, (11, 11))
+            variance = sq_mean - mean * mean
+            # High-variance pixels (text, edges, graphics) are not oil
+            high_var = (variance > 400).astype(np.uint8) * 255
+            mask = mask & cv2.bitwise_not(high_var)
+
+    return mask
 
 
 # =====================================================================
 # STEP 1.6: Direct oil-line detection (Canny + Hough)
 # =====================================================================
 
-def _detect_oil_line_direct(bottle_crop):
+def _detect_oil_line_direct(bottle_crop, label_zone=None):
     """Detect the oil meniscus directly on the bottle crop.
 
     Returns (y_relative, confidence, meta) where y_relative is the oil-line Y
     position as a fraction of bottle HEIGHT (0.0 top, 1.0 bottom),
     or (None, 0.0, {}) if no convincing line is found.
 
+    When *label_zone* is provided, candidates inside the label region are
+    penalized so that label edges are not mistaken for the oil surface.
+
     Strategy:
     1. Restrict to body ROI (avoid cap / handle edges).
     2. Canny edges + HoughLinesP to collect near-horizontal segments.
     3. Score each candidate by the brightness step across it
        (oil-to-air transition produces a strong delta).
-    4. Return the best scoring line's Y (remapped to full-bottle coords).
+    4. Apply label zone penalty and texture uniformity adjustments.
+    5. Return the best scoring line's Y (remapped to full-bottle coords).
     """
     bh_full = bottle_crop.shape[0]
     if bh_full < 80:
@@ -276,6 +396,12 @@ def _detect_oil_line_direct(bottle_crop):
     if lines is None:
         return None, 0.0, {}
 
+    # Precompute local variance for texture scoring
+    gray_f = gray.astype(np.float32)
+    mean_img = cv2.blur(gray_f, (11, 11))
+    sq_mean_img = cv2.blur(gray_f * gray_f, (11, 11))
+    variance_img = sq_mean_img - mean_img * mean_img
+
     # Collect near-horizontal segments and aggregate by Y.
     band_h = 6  # group segments within ±6 pixels
     buckets = {}
@@ -291,6 +417,14 @@ def _detect_oil_line_direct(bottle_crop):
     if not buckets:
         return None, 0.0, {}
 
+    # Label zone boundaries in ROI coordinates
+    lz_top_roi = None
+    lz_bot_roi = None
+    if label_zone and label_zone.get("detected"):
+        lz_top_roi = label_zone["top"] * bh_full - ry
+        lz_bot_roi = label_zone["bottom"] * bh_full - ry
+        lz_margin = rh * 0.05  # ±5% margin around label boundary
+
     # Score each bucket by brightness delta (oil darker than air above it).
     candidates = []
     for key, segs in buckets.items():
@@ -305,10 +439,32 @@ def _detect_oil_line_direct(bottle_crop):
             continue
         above = float(gray[up1:up2].mean())
         below = float(gray[dn1:dn2].mean())
-        delta = below - above  # positive = darker above (empty) / brighter below (oil)
-        # Oil is golden/yellow → brighter than empty air in LAB L but darker in
-        # some scenes. Use absolute delta as the signal.
+        delta = below - above
         score = abs(delta) * (total_len / rw)
+
+        # --- Label zone penalty ---
+        if lz_top_roi is not None and lz_bot_roi is not None:
+            if lz_top_roi <= y_mid <= lz_bot_roi:
+                # Inside label zone: strong penalty
+                score *= 0.10
+            elif (lz_top_roi - lz_margin <= y_mid < lz_top_roi or
+                  lz_bot_roi < y_mid <= lz_bot_roi + lz_margin):
+                # Near label boundary: moderate penalty
+                score *= 0.40
+
+        # --- Texture uniformity bonus ---
+        # Real oil surface: smooth regions above and below the edge
+        # Label boundary: high-variance text/graphics nearby
+        var_above = float(variance_img[up1:up2].mean()) if up2 > up1 else 999
+        var_below = float(variance_img[dn1:dn2].mean()) if dn2 > dn1 else 999
+        avg_var = (var_above + var_below) / 2.0
+        if avg_var < 200:
+            # Low variance = smooth (oil/air) → boost
+            score *= 1.3
+        elif avg_var > 800:
+            # High variance = label text → penalize
+            score *= 0.5
+
         candidates.append(
             {"y": y_mid, "score": float(score), "delta": float(delta), "len": int(total_len)}
         )
@@ -340,6 +496,175 @@ def _detect_oil_line_direct(bottle_crop):
         "roi": {"x": int(rx), "y": int(ry), "w": int(rw), "h": int(rh)},
         "candidate_count": int(len(candidates)),
         "used_count": int(len(nearby)),
+    }
+
+
+# =====================================================================
+# STEP 1.7: Side-strip oil detection (avoids label entirely)
+# =====================================================================
+
+def _detect_oil_line_side_strips(bottle_crop, label_zone):
+    """Detect oil surface by scanning transparent side strips of the bottle.
+
+    The Afia 1.5L bottle has transparent plastic on the left side of the
+    label (the right side has the handle and is unreliable). Oil is directly
+    visible through the plastic without label interference.
+
+    Uses HSV saturation + Lab b* to distinguish oil (saturated yellow) from
+    empty space (desaturated/neutral). Scans from bottom upward to find where
+    oil presence drops off, then validates the transition.
+
+    Returns (y_relative, confidence, meta) like _detect_oil_line_direct.
+    """
+    h, w = bottle_crop.shape[:2]
+    if h < 80 or w < 40:
+        return None, 0.0, {}
+
+    # Define side strips relative to label boundaries
+    lz_left = label_zone.get("left", 0.15)
+    lz_right = label_zone.get("right", 0.85)
+
+    # Left strip: from 5% to label left edge (primary, no handle)
+    # Right strip: from label right edge to 95% (may have handle, less reliable)
+    strip_margin = 0.05
+    strips = []
+
+    left_start = int(w * strip_margin)
+    left_end = int(w * max(strip_margin + 0.03, lz_left - 0.03))
+    if left_end - left_start >= 6:
+        strips.append((left_start, left_end, "left", 1.0))  # full trust
+
+    right_start = int(w * min(lz_right + 0.03, 1.0 - strip_margin - 0.03))
+    right_end = int(w * (1.0 - strip_margin))
+    if right_end - right_start >= 6:
+        strips.append((right_start, right_end, "right", 0.5))  # half trust (handle)
+
+    if not strips:
+        return None, 0.0, {}
+
+    # Convert to Lab and HSV
+    lab = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2HSV)
+    b_channel = lab[:, :, 2].astype(np.float32)  # b*: >128 = yellow
+    sat_channel = hsv[:, :, 1].astype(np.float32)  # saturation
+
+    # Restrict vertical scan to body region (skip cap + base)
+    y_top = int(h * 0.08)
+    y_bot = int(h * 0.95)
+    scan_len = y_bot - y_top
+    if scan_len < 30:
+        return None, 0.0, {}
+
+    transition_ys = []
+    strip_confs = []
+
+    for sx, ex, side, trust in strips:
+        # Build a combined "oil presence" score per row:
+        # high b* (yellow) AND high saturation → oil
+        strip_b = b_channel[y_top:y_bot, sx:ex].mean(axis=1)
+        strip_s = sat_channel[y_top:y_bot, sx:ex].mean(axis=1)
+
+        # Normalize both to 0-1 range
+        b_min, b_max = float(strip_b.min()), float(strip_b.max())
+        s_min, s_max = float(strip_s.min()), float(strip_s.max())
+
+        if b_max - b_min < 3.0 and s_max - s_min < 10.0:
+            # No meaningful variation — can't distinguish oil from air
+            continue
+
+        b_norm = (strip_b - b_min) / max(1.0, b_max - b_min)
+        s_norm = (strip_s - s_min) / max(1.0, s_max - s_min)
+
+        # Combined oil score: weighted mean of b* and saturation
+        oil_score = 0.6 * b_norm + 0.4 * s_norm
+
+        # Heavy smoothing to avoid noise
+        kernel_size = max(7, int(scan_len * 0.06))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        smoothed = np.convolve(oil_score, np.ones(kernel_size) / kernel_size,
+                               mode="same")
+
+        # Scan from bottom upward: find where oil_score drops below a threshold
+        # The threshold is set relative to the bottom region's oil score
+        bottom_region = smoothed[int(scan_len * 0.7):]
+        if len(bottom_region) < 5:
+            continue
+        bottom_mean = float(np.mean(bottom_region))
+
+        top_region = smoothed[:int(scan_len * 0.15)]
+        if len(top_region) < 5:
+            continue
+        top_mean = float(np.mean(top_region))
+
+        # Need meaningful difference between top and bottom
+        score_diff = bottom_mean - top_mean
+        if score_diff < 0.10:
+            # Very small difference — either full or empty or ambiguous
+            # For full bottle: both top and bottom have high oil score
+            # Very small score difference: can't reliably determine oil line.
+            # Nearly-full or nearly-empty — let reference handle these cases.
+            continue
+
+        # Find the transition: scan from bottom upward
+        # Threshold: midpoint between top and bottom scores
+        threshold = top_mean + score_diff * 0.45
+
+        transition_idx = None
+        for i in range(scan_len - 1, -1, -1):
+            if smoothed[i] < threshold:
+                transition_idx = i
+                break
+
+        if transition_idx is None:
+            continue
+
+        # Skip if the transition is at the very bottom (bottle base) or
+        # very top (cap/neck) — these are not oil surface transitions
+        if transition_idx > scan_len * 0.92 or transition_idx < scan_len * 0.03:
+            continue
+
+        # Validate: check that the region below is indeed higher score
+        validate_below = int(min(scan_len, transition_idx + scan_len * 0.08))
+        validate_above = int(max(0, transition_idx - scan_len * 0.08))
+        if validate_below < scan_len and validate_above >= 0:
+            below_val = float(smoothed[transition_idx:validate_below].mean())
+            above_val = float(smoothed[validate_above:transition_idx].mean())
+            if below_val - above_val < 0.05:
+                # Not a convincing transition
+                continue
+
+        transition_y = y_top + transition_idx
+        # Confidence based on the score difference and trust factor
+        conf = min(0.75, 0.25 + score_diff * 1.5) * trust
+
+        transition_ys.append(transition_y)
+        strip_confs.append(conf)
+
+    if not transition_ys:
+        return None, 0.0, {}
+
+    # Combine results from strips
+    if len(transition_ys) == 2:
+        diff = abs(transition_ys[0] - transition_ys[1]) / h
+        if diff < 0.10:
+            y_combined = np.average(transition_ys, weights=strip_confs)
+            conf_combined = max(strip_confs) * 1.1
+        else:
+            best_idx = int(np.argmax(strip_confs))
+            y_combined = transition_ys[best_idx]
+            conf_combined = strip_confs[best_idx] * 0.8
+    else:
+        y_combined = transition_ys[0]
+        conf_combined = strip_confs[0] * 0.9
+
+    y_relative = float(y_combined) / h
+    conf_combined = float(np.clip(conf_combined, 0.0, 0.75))
+
+    return y_relative, conf_combined, {
+        "method": "side_strips",
+        "num_strips": len(strips),
+        "strip_agreement": len(transition_ys),
     }
 
 
@@ -482,6 +807,10 @@ def _compare(img1, img2_ref):
     body_aligned, _ = _body_roi(aligned)
     body_ref, _ = _body_roi(img2_ref)
 
+    # Detect label zone on the aligned image for label-aware oil masking
+    lz = _detect_label_zone(aligned)
+    label_mask = lz["mask"] if lz.get("detected") else None
+
     # --- A: Brightness profile correlation ---
     g1 = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(float)
     g2 = cv2.cvtColor(img2_ref, cv2.COLOR_BGR2GRAY).astype(float)
@@ -498,21 +827,28 @@ def _compare(img1, img2_ref):
     upper_sim = max(0.0, 1.0 - mse_upper / 5000.0)
 
     # --- C: Golden oil amount (adaptive HSV, measured on body ROI) ---
-    def golden_amount(img):
-        mask = _adaptive_oil_mask(img)
+    def golden_amount(img, lm=None):
+        mask = _adaptive_oil_mask(img, label_mask=lm)
         return mask.sum() / (mask.shape[0] * mask.shape[1] * 255)
 
-    ga1 = golden_amount(body_aligned)
+    # Build body-sized label mask for body ROI metrics
+    body_lm = None
+    if label_mask is not None:
+        bh_a, bw_a = body_aligned.shape[:2]
+        body_lz = _detect_label_zone(body_aligned)
+        body_lm = body_lz["mask"] if body_lz.get("detected") else None
+
+    ga1 = golden_amount(body_aligned, body_lm)
     ga2 = golden_amount(body_ref)
     golden_sim = max(0.0, 1.0 - abs(ga1 - ga2) * 5.0)
 
     # --- D: Golden vertical profile (WHERE is oil) ---
-    def golden_profile(img):
-        mask = _adaptive_oil_mask(img)
+    def golden_profile(img, lm=None):
+        mask = _adaptive_oil_mask(img, label_mask=lm)
         profile = mask.mean(axis=1) / 255.0
         return np.convolve(profile, np.ones(15) / 15, mode="same")
 
-    gp1 = golden_profile(aligned)
+    gp1 = golden_profile(aligned, label_mask)
     gp2 = golden_profile(img2_ref)
     min_len = min(len(gp1), len(gp2))
     gp_diff = float(np.mean(np.abs(gp1[:min_len] - gp2[:min_len])))
@@ -564,7 +900,7 @@ def _compare(img1, img2_ref):
 # =====================================================================
 
 _CACHED_REFS = None
-_DB_REF_CACHE_KEY = "oil_references_v1"
+_DB_REF_CACHE_KEY = "oil_references_v2"
 
 
 def invalidate_reference_cache():
@@ -596,18 +932,24 @@ def extract_reference_features(image_path: str):
     normalized = _normalize(bottle_crop)
     body, _ = _body_roi(normalized)
 
+    # Detect label zone for label-aware oil masking
+    lz = _detect_label_zone(normalized)
+    lm = lz["mask"] if lz.get("detected") else None
+
     # Brightness profile (per-row mean of grayscale, 1D array)
     gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY).astype(float)
     brightness_profile = gray.mean(axis=1).tolist()
 
     # Golden profile (adaptive mask per-row mean)
-    mask = _adaptive_oil_mask(normalized)
+    mask = _adaptive_oil_mask(normalized, label_mask=lm)
     golden_profile_arr = mask.mean(axis=1) / 255.0
     golden_profile_arr = np.convolve(golden_profile_arr, np.ones(15) / 15, mode="same")
     golden_profile = golden_profile_arr.tolist()
 
     # Golden amount (scalar 0-1)
-    body_mask = _adaptive_oil_mask(body)
+    body_lz = _detect_label_zone(body)
+    body_lm = body_lz["mask"] if body_lz.get("detected") else None
+    body_mask = _adaptive_oil_mask(body, label_mask=body_lm)
     golden_amt = float(body_mask.sum() / (body_mask.shape[0] * body_mask.shape[1] * 255))
 
     # H-S histogram on body (flattened list of floats)
@@ -799,114 +1141,127 @@ def _interpolate(results):
 
 
 # =====================================================================
-# Main processing
+# Detection fusion
 # =====================================================================
 
-# def process_bottle_image(image_path: str, bottle_spec):
-#     start = time.time()
-#     logger.info("Processing: %s", image_path)
+def _y_rel_to_percentage(y_rel):
+    """Convert y_relative (0=top, 1=bottom) to oil percentage (0=empty, 100=full)."""
+    return float(np.clip((1.0 - y_rel) * 100.0, 0.0, 100.0))
 
-#     image = _load_image(image_path)
-#     original = image.copy()
 
-#     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
-#     input_norm = _normalize(bottle_crop)
+def _fuse_detections(direct_result, side_strip_result, ref_result, label_zone):
+    """Fuse all detection paths into a single oil percentage + confidence.
 
-#     # Keep normalization computed for pipeline compatibility and future use.
-#     _ = input_norm
+    Priority: side-strip (avoids label) > reference (calibrated) > direct edge.
+    Agreement between methods boosts confidence; disagreement triggers vetoes.
 
-#     edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(bottle_crop)
-#     if edge_y_rel is None:
-#         raise ProcessingError("Oil level line could not be detected")
+    Each *_result is a dict with keys "percentage" and "confidence" (or None).
 
-#     # Coordinate system reminder: image origin is top-left, y grows downward.
-#     top_y = int(by)
-#     bottom_y = int(by + bh)
-#     oil_level_y = int(round(by + (edge_y_rel * bh)))
-#     denom = float(bottom_y - top_y)
-#     if denom <= 0:
-#         raise ProcessingError("Invalid bottle boundaries for oil normalization")
+    Returns (oil_percentage, confidence, source_description).
+    """
+    detections = []
 
-#     oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
-#     oil_percentage = float(np.clip(oil_percentage, 0.0, 100.0))
-#     oil_ratio = oil_percentage / 100.0
-#     oil_level = int(round(oil_percentage))
-#     confidence = float(np.clip(edge_conf, 0.0, 0.96))
+    # Collect valid detections
+    if direct_result and direct_result.get("confidence", 0) > 0:
+        d = dict(direct_result)
+        d["name"] = "direct"
+        d["base_weight"] = 0.20
+        # Label zone veto: if direct result falls inside label zone, reduce confidence
+        if label_zone and label_zone.get("detected"):
+            lz_top_pct = (1.0 - label_zone["bottom"]) * 100.0
+            lz_bot_pct = (1.0 - label_zone["top"]) * 100.0
+            pct = d["percentage"]
+            if lz_top_pct <= pct <= lz_bot_pct:
+                logger.info("Label zone veto: direct=%.1f%% inside label [%.1f%%, %.1f%%]",
+                            pct, lz_top_pct, lz_bot_pct)
+                d["confidence"] *= 0.15
+        detections.append(d)
 
-#     total = float(bottle_spec.total_volume_liters)
-#     remaining = oil_ratio * total
-#     consumed = total - remaining
-#     cup = float(bottle_spec.cup_conversion_ratio)
-#     remaining_cups = remaining / cup if cup > 0 else 0
-#     consumed_cups = consumed / cup if cup > 0 else 0
+    if side_strip_result and side_strip_result.get("confidence", 0) > 0:
+        d = dict(side_strip_result)
+        d["name"] = "side_strip"
+        d["base_weight"] = 0.30  # Useful corroboration but noisy on its own
+        detections.append(d)
 
-#     logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
+    if ref_result and ref_result.get("confidence", 0) > 0:
+        d = dict(ref_result)
+        d["name"] = "reference"
+        d["base_weight"] = 0.50  # Most reliable: calibrated multi-metric comparison
+        detections.append(d)
 
-#     # ---- DEBUG OVERLAY: top, bottom and detected oil level lines ----
-#     img_h, img_w = original.shape[:2]
-#     overlay = original.copy()
+    if not detections:
+        return None, 0.0, "none"
 
-#     oil_y = oil_level_y
-#     top_line_y = top_y
-#     bottom_line_y = bottom_y
+    # Single detection: use it directly
+    if len(detections) == 1:
+        d = detections[0]
+        return d["percentage"], d["confidence"], d["name"]
 
-#     # Blue top boundary line
-#     cv2.line(overlay, (0, top_line_y), (img_w, top_line_y), (255, 0, 0), 2)
-#     # Yellow bottom boundary line
-#     cv2.line(overlay, (0, bottom_line_y), (img_w, bottom_line_y), (0, 255, 255), 2)
-#     # Red oil level line
-#     cv2.line(overlay, (0, oil_y), (img_w, oil_y), (0, 0, 255), 3)
+    # Check agreement between pairs
+    for i in range(len(detections)):
+        for j in range(i + 1, len(detections)):
+            diff = abs(detections[i]["percentage"] - detections[j]["percentage"])
+            if diff <= 10:
+                # Agreement bonus
+                detections[i]["confidence"] = min(0.95, detections[i]["confidence"] * 1.15)
+                detections[j]["confidence"] = min(0.95, detections[j]["confidence"] * 1.15)
 
-#     # Oil percentage label above the line
-#     fs = max(0.6, min(1.6, img_w / 400.0))
-#     th = max(2, int(fs * 2))
-#     label = f"{oil_level}%"
-#     (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    # If direct disagrees with both others by >15%, trust the others
+    if len(detections) >= 2:
+        direct_d = next((d for d in detections if d["name"] == "direct"), None)
+        others = [d for d in detections if d["name"] != "direct"]
+        if direct_d and len(others) >= 1:
+            disagrees_all = all(
+                abs(direct_d["percentage"] - o["percentage"]) > 15 for o in others
+            )
+            if disagrees_all:
+                direct_d["confidence"] *= 0.15
+                logger.info("Direct detection (%.1f%%) disagrees with all others; suppressed",
+                            direct_d["percentage"])
 
-#     # Position label centered horizontally on the bottle, above the line
-#     label_x = max(10, min(img_w - tw - 10, bx + bw // 2 - tw // 2))
-#     label_y = max(th_text + 10, oil_y - 10)
+    # If side-strip disagrees with reference by >20%, reduce side-strip weight
+    if len(detections) >= 2:
+        ss_d = next((d for d in detections if d["name"] == "side_strip"), None)
+        ref_d = next((d for d in detections if d["name"] == "reference"), None)
+        if ss_d and ref_d:
+            diff = abs(ss_d["percentage"] - ref_d["percentage"])
+            if diff > 20:
+                ss_d["confidence"] *= 0.20
+                logger.info("Side-strip (%.1f%%) disagrees with reference (%.1f%%) by %.0f%%; suppressed",
+                            ss_d["percentage"], ref_d["percentage"], diff)
+            elif diff > 12:
+                ss_d["confidence"] *= 0.50
+                logger.info("Side-strip (%.1f%%) moderately disagrees with reference (%.1f%%)",
+                            ss_d["percentage"], ref_d["percentage"])
 
-#     # White outline for readability
-#     cv2.putText(overlay, label, (label_x, label_y),
-#                 cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th + 3, cv2.LINE_AA)
-#     cv2.putText(overlay, label, (label_x, label_y),
-#                 cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), th, cv2.LINE_AA)
+    # Weighted average of all valid detections
+    total_weight = 0.0
+    weighted_pct = 0.0
+    sources = []
+    for d in detections:
+        w = d["base_weight"] * d["confidence"]
+        if w > 0.01:
+            weighted_pct += d["percentage"] * w
+            total_weight += w
+            sources.append(f"{d['name']}({d['percentage']:.0f}%@{d['confidence']:.2f})")
 
-#     processed_dir = Path(settings.MEDIA_ROOT) / "scans" / "processed"
-#     _ensure_dir(processed_dir)
-#     fname = f"processed_{uuid.uuid4().hex}.jpg"
-#     cv2.imwrite(str(processed_dir / fname), overlay)
+    if total_weight < 0.01:
+        # All detections had near-zero weight; pick highest confidence
+        best = max(detections, key=lambda d: d["confidence"])
+        return best["percentage"], best["confidence"], best["name"]
 
-#     processing_time_ms = int((time.time() - start) * 1000)
-#     logger.info("Done in %dms", processing_time_ms)
+    fused_pct = weighted_pct / total_weight
+    fused_conf = min(0.96, max(d["confidence"] for d in detections))
 
-#     return {
-#         "processed_path": f"scans/processed/{fname}",
-#         "oil_height_pixels": float(bh * oil_ratio),
-#         "bottle_height_pixels": float(bh),
-#         "oil_ratio": oil_ratio,
-#         "remaining_volume_liters": remaining,
-#         "consumed_volume_liters": consumed,
-#         "remaining_cups": remaining_cups,
-#         "consumed_cups": consumed_cups,
-#         "confidence_score": round(confidence, 2),
-#         "processing_time_ms": processing_time_ms,
-#         "oil_line_debug": {
-#             "top_y": int(top_y),
-#             "bottom_y": int(bottom_y),
-#             "oil_level_y": int(oil_level_y),
-#             "detector": edge_meta,
-#         },
-#         "bottle_bbox": {
-#             "x": int(bx),
-#             "y": int(by),
-#             "w": int(bw),
-#             "h": int(bh),
-#             "image_w": int(img_w),
-#             "image_h": int(img_h),
-#         },
-#     }
+    source_desc = " + ".join(sources)
+    logger.info("Fused: %.1f%% conf=%.2f from %s", fused_pct, fused_conf, source_desc)
+
+    return float(np.clip(fused_pct, 0.0, 100.0)), float(fused_conf), source_desc
+
+
+# =====================================================================
+# Main processing
+# =====================================================================
 
 def process_bottle_image(image_path: str, bottle_spec):
     start = time.time()
@@ -918,11 +1273,44 @@ def process_bottle_image(image_path: str, bottle_spec):
     bottle_crop, (bx, by, bw, bh) = _crop_bottle(image)
     input_norm = _normalize(bottle_crop)
 
-    edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(bottle_crop)
+    # ---- 1. Detect label zone FIRST ----
+    label_zone = _detect_label_zone(bottle_crop)
+    logger.info("Label zone: detected=%s top=%.2f bottom=%.2f",
+                label_zone["detected"], label_zone["top"], label_zone["bottom"])
 
-    # Fallback path for images where the meniscus edge is weak (e.g. near-full).
-    ref_level = None
-    ref_conf = 0.0
+    # ---- 2. Run all 3 detection paths ----
+
+    # Path A: Direct edge detection (with label penalty)
+    direct_result = None
+    edge_meta = {}
+    edge_y_rel, edge_conf, edge_meta = _detect_oil_line_direct(
+        bottle_crop, label_zone=label_zone
+    )
+    if edge_y_rel is not None:
+        direct_result = {
+            "percentage": _y_rel_to_percentage(edge_y_rel),
+            "confidence": float(edge_conf),
+            "y_rel": edge_y_rel,
+        }
+
+    # Path B: Side-strip detection (avoids label entirely)
+    side_strip_result = None
+    side_meta = {}
+    try:
+        ss_y_rel, ss_conf, side_meta = _detect_oil_line_side_strips(
+            bottle_crop, label_zone
+        )
+        if ss_y_rel is not None:
+            side_strip_result = {
+                "percentage": _y_rel_to_percentage(ss_y_rel),
+                "confidence": float(ss_conf),
+                "y_rel": ss_y_rel,
+            }
+    except Exception as exc:
+        logger.warning("Side-strip detection failed: %s", exc)
+
+    # Path C: Reference comparison
+    ref_result = None
     ref_meta = {}
     try:
         references = _load_references()
@@ -934,8 +1322,23 @@ def process_bottle_image(image_path: str, bottle_spec):
                 "best_level": float(results[0]["level"]),
                 "best_score": float(results[0]["score"]),
             }
+            ref_result = {
+                "percentage": ref_level,
+                "confidence": float(ref_conf),
+            }
     except Exception as exc:
-        logger.warning("Reference fallback unavailable: %s", exc)
+        logger.warning("Reference comparison unavailable: %s", exc)
+
+    # ---- 3. Fuse all detection results ----
+    oil_percentage, confidence, detector_source = _fuse_detections(
+        direct_result, side_strip_result, ref_result, label_zone
+    )
+
+    if oil_percentage is None:
+        raise ProcessingError(
+            "Oil level could not be detected by any method "
+            "(direct edge, side strips, or reference comparison)"
+        )
 
     # Coordinate system reminder: image origin is top-left, y grows downward.
     top_y = int(by)
@@ -944,27 +1347,11 @@ def process_bottle_image(image_path: str, bottle_spec):
     if denom <= 0:
         raise ProcessingError("Invalid bottle boundaries for oil normalization")
 
-    detector_source = None
-    if edge_y_rel is not None:
-        oil_level_y = int(round(by + (edge_y_rel * bh)))
-        oil_percentage = ((bottom_y - oil_level_y) / denom) * 100.0
-        detector_source = "direct_line"
-        confidence = float(np.clip(edge_conf, 0.0, 0.96))
-    elif ref_level is not None:
-        oil_percentage = float(ref_level)
-        oil_level_y = int(round(bottom_y - ((oil_percentage / 100.0) * denom)))
-        detector_source = "reference_fallback"
-        confidence = float(np.clip(ref_conf * 0.90, 0.0, 0.90))
-        logger.info(
-            "Direct oil line not found; using reference fallback: level=%.1f%% conf=%.2f",
-            oil_percentage, confidence,
-        )
-    else:
-        raise ProcessingError("Oil level line could not be detected and no fallback reference estimate is available")
-
     oil_percentage = float(np.clip(oil_percentage, 0.0, 100.0))
     oil_ratio = oil_percentage / 100.0
     oil_level = int(round(oil_percentage))
+    oil_level_y = int(round(bottom_y - (oil_ratio * denom)))
+    confidence = float(np.clip(confidence, 0.0, 0.96))
 
     # ----------------------------------------------------------------
     # Volume calculation — guard against misconfigured bottle_spec.
@@ -1010,9 +1397,10 @@ def process_bottle_image(image_path: str, bottle_spec):
             remaining, total, oil_ratio,
         )
 
-    logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f", oil_level, remaining, confidence)
+    logger.info("Result: oil=%d%% remain=%.2fL conf=%.2f source=%s",
+                oil_level, remaining, confidence, detector_source)
 
-    # ---- DEBUG OVERLAY: top, bottom and detected oil level lines ----
+    # ---- DEBUG OVERLAY: top, bottom, detected oil level, and label zone ----
     img_h, img_w = original.shape[:2]
     overlay = original.copy()
 
@@ -1026,6 +1414,15 @@ def process_bottle_image(image_path: str, bottle_spec):
     cv2.line(overlay, (0, bottom_line_y), (img_w, bottom_line_y), (0, 255, 255), 2)
     # Red oil level line
     cv2.line(overlay, (0, oil_y), (img_w, oil_y), (0, 0, 255), 3)
+
+    # Green rectangle for label zone bounds (debug)
+    if label_zone.get("detected"):
+        lz_top_px = int(by + label_zone["top"] * bh)
+        lz_bot_px = int(by + label_zone["bottom"] * bh)
+        lz_left_px = int(bx + label_zone["left"] * bw)
+        lz_right_px = int(bx + label_zone["right"] * bw)
+        cv2.rectangle(overlay, (lz_left_px, lz_top_px), (lz_right_px, lz_bot_px),
+                       (0, 255, 0), 1)
 
     # Oil percentage label above the line
     fs = max(0.6, min(1.6, img_w / 400.0))
@@ -1067,8 +1464,22 @@ def process_bottle_image(image_path: str, bottle_spec):
             "bottom_y": int(bottom_y),
             "oil_level_y": int(oil_level_y),
             "source": detector_source,
-            "detector": edge_meta,
+            "direct": {
+                "percentage": direct_result["percentage"] if direct_result else None,
+                "confidence": direct_result["confidence"] if direct_result else 0,
+                "meta": edge_meta,
+            },
+            "side_strip": {
+                "percentage": side_strip_result["percentage"] if side_strip_result else None,
+                "confidence": side_strip_result["confidence"] if side_strip_result else 0,
+                "meta": side_meta,
+            },
             "reference": ref_meta,
+            "label_zone": {
+                "detected": label_zone["detected"],
+                "top": label_zone["top"],
+                "bottom": label_zone["bottom"],
+            },
         },
         "bottle_bbox": {
             "x": int(bx),
