@@ -512,172 +512,129 @@ def _detect_oil_line_direct(bottle_crop, label_zone=None):
 
 
 # =====================================================================
-# STEP 1.7: Side-strip oil detection (avoids label entirely)
+# STEP 1.7: Yellow-position oil detection (relative to label)
 # =====================================================================
 
 def _detect_oil_line_side_strips(bottle_crop, label_zone):
-    """Detect oil surface by scanning transparent side strips of the bottle.
+    """Detect oil level using yellow color position relative to the label.
 
-    The Afia 1.5L bottle has transparent plastic on the left side of the
-    label (the right side has the handle and is unreliable). Oil is directly
-    visible through the plastic without label interference.
+    Core logic (positional reasoning):
+    1. Yellow found ABOVE the label → oil is definitely above the label.
+       The bottle is transparent there, so any yellow = oil (no confusion).
+       Scan from top down to find where yellow starts → oil surface.
 
-    Uses HSV saturation + Lab b* to distinguish oil (saturated yellow) from
-    empty space (desaturated/neutral). Scans from bottom upward to find where
-    oil presence drops off, then validates the transition.
+    2. No yellow above label → oil is within or below the label.
+       Check LEFT STRIP (transparent side of bottle, no handle) for yellow.
+       Scan from top down through the label zone → find where yellow starts.
+
+    3. No yellow in strips either → check BELOW the label.
+       Empty space between label bottom and yellow → oil is low.
+
+    4. No yellow anywhere → bottle is empty.
 
     Returns (y_relative, confidence, meta) like _detect_oil_line_direct.
     """
     h, w = bottle_crop.shape[:2]
-    if h < 80 or w < 40:
+    if h < 60 or w < 30:
         return None, 0.0, {}
 
-    # Define side strips relative to label boundaries
-    lz_left = label_zone.get("left", 0.15)
-    lz_right = label_zone.get("right", 0.85)
-
-    # Left strip: from 5% to label left edge (primary, no handle)
-    # Right strip: from label right edge to 95% (may have handle, less reliable)
-    strip_margin = 0.05
-    strips = []
-
-    left_start = int(w * strip_margin)
-    left_end = int(w * max(strip_margin + 0.03, lz_left - 0.03))
-    if left_end - left_start >= 6:
-        strips.append((left_start, left_end, "left", 1.0))  # full trust
-
-    right_start = int(w * min(lz_right + 0.03, 1.0 - strip_margin - 0.03))
-    right_end = int(w * (1.0 - strip_margin))
-    if right_end - right_start >= 6:
-        strips.append((right_start, right_end, "right", 0.5))  # half trust (handle)
-
-    if not strips:
-        return None, 0.0, {}
-
-    # Convert to Lab and HSV
-    lab = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2LAB)
     hsv = cv2.cvtColor(bottle_crop, cv2.COLOR_BGR2HSV)
-    b_channel = lab[:, :, 2].astype(np.float32)  # b*: >128 = yellow
-    sat_channel = hsv[:, :, 1].astype(np.float32)  # saturation
 
-    # Restrict vertical scan to body region (skip cap + base)
-    y_top = int(h * 0.08)
-    y_bot = int(h * 0.95)
-    scan_len = y_bot - y_top
-    if scan_len < 30:
-        return None, 0.0, {}
+    # Golden/yellow oil mask — deliberately narrow to avoid label yellows
+    oil_mask = cv2.inRange(hsv,
+                           np.array([12, 50, 50], dtype=np.uint8),
+                           np.array([35, 255, 255], dtype=np.uint8))
+    # Light morphological open to remove noise specks
+    oil_mask = cv2.morphologyEx(oil_mask, cv2.MORPH_OPEN,
+                                np.ones((3, 3), np.uint8))
 
-    transition_ys = []
-    strip_confs = []
+    label_top_px = int(label_zone["top"] * h)
+    label_bot_px = int(label_zone["bottom"] * h)
+    label_left_px = int(label_zone.get("left", 0.10) * w)
 
-    for sx, ex, side, trust in strips:
-        # Build a combined "oil presence" score per row:
-        # high b* (yellow) AND high saturation → oil
-        strip_b = b_channel[y_top:y_bot, sx:ex].mean(axis=1)
-        strip_s = sat_channel[y_top:y_bot, sx:ex].mean(axis=1)
+    cap_zone = int(h * 0.05)  # skip cap/neck at very top
+    base_zone = int(h * 0.96)  # skip base at very bottom
 
-        # Normalize both to 0-1 range
-        b_min, b_max = float(strip_b.min()), float(strip_b.max())
-        s_min, s_max = float(strip_s.min()), float(strip_s.max())
+    # Helper: smooth a per-row profile
+    def _smooth(arr, frac=0.05):
+        ks = max(5, int(len(arr) * frac))
+        if ks % 2 == 0:
+            ks += 1
+        return np.convolve(arr, np.ones(ks) / ks, mode="same")
 
-        if b_max - b_min < 3.0 and s_max - s_min < 10.0:
-            # No meaningful variation — can't distinguish oil from air
-            continue
+    # ── PHASE 1: Yellow ABOVE the label ──────────────────────────────
+    # Above the label the bottle is transparent → any yellow IS oil.
+    if label_top_px > cap_zone + 10:
+        above = oil_mask[cap_zone:label_top_px, :]
+        per_row = above.mean(axis=1) / 255.0
+        smoothed = _smooth(per_row)
 
-        b_norm = (strip_b - b_min) / max(1.0, b_max - b_min)
-        s_norm = (strip_s - s_min) / max(1.0, s_max - s_min)
+        # Scan from TOP down — first row with meaningful yellow = oil surface
+        threshold = 0.06  # at least 6% of the row is yellow
+        for i in range(len(smoothed)):
+            if smoothed[i] > threshold:
+                oil_line_y = cap_zone + i
+                # Confidence: more yellow = more certain
+                yellow_amount = float(smoothed[i:].mean())
+                conf = float(np.clip(0.55 + yellow_amount * 2.0, 0.55, 0.92))
+                logger.info("Yellow-position: oil ABOVE label at y=%d (%.1f%%), "
+                            "yellow_density=%.2f",
+                            oil_line_y, (1 - oil_line_y / h) * 100, yellow_amount)
+                return float(oil_line_y / h), conf, {
+                    "zone": "above_label",
+                    "yellow_density": yellow_amount,
+                }
 
-        # Combined oil score: weighted mean of b* and saturation
-        oil_score = 0.6 * b_norm + 0.4 * s_norm
+    # ── PHASE 2: Left strip through & around label zone ──────────────
+    # The left side of the bottle is transparent (handle is on the right).
+    # Scan this strip from top to bottom for the first yellow row.
+    strip_x1 = max(2, int(w * 0.03))
+    strip_x2 = max(strip_x1 + 4, label_left_px - 2)
+    # Also try a slightly wider center-left strip if the left is too narrow
+    if strip_x2 - strip_x1 < 6:
+        strip_x2 = max(strip_x1 + 6, int(w * 0.15))
 
-        # Heavy smoothing to avoid noise
-        kernel_size = max(7, int(scan_len * 0.06))
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        smoothed = np.convolve(oil_score, np.ones(kernel_size) / kernel_size,
-                               mode="same")
+    if strip_x2 > strip_x1:
+        strip = oil_mask[cap_zone:base_zone, strip_x1:strip_x2]
+        if strip.size > 0:
+            per_row = strip.mean(axis=1) / 255.0
+            smoothed = _smooth(per_row)
 
-        # Scan from bottom upward: find where oil_score drops below a threshold
-        # The threshold is set relative to the bottom region's oil score
-        bottom_region = smoothed[int(scan_len * 0.7):]
-        if len(bottom_region) < 5:
-            continue
-        bottom_mean = float(np.mean(bottom_region))
+            threshold = 0.10  # stronger threshold for strip (narrower)
+            for i in range(len(smoothed)):
+                if smoothed[i] > threshold:
+                    oil_line_y = cap_zone + i
+                    yellow_amount = float(smoothed[i:].mean())
+                    conf = float(np.clip(0.45 + yellow_amount * 1.5, 0.45, 0.82))
+                    logger.info("Yellow-position: oil in LEFT STRIP at y=%d (%.1f%%)",
+                                oil_line_y, (1 - oil_line_y / h) * 100)
+                    return float(oil_line_y / h), conf, {
+                        "zone": "left_strip",
+                        "yellow_density": yellow_amount,
+                    }
 
-        top_region = smoothed[:int(scan_len * 0.15)]
-        if len(top_region) < 5:
-            continue
-        top_mean = float(np.mean(top_region))
+    # ── PHASE 3: Below the label ─────────────────────────────────────
+    # If label is not at the very bottom, check below it
+    if label_bot_px < base_zone - 10:
+        below = oil_mask[label_bot_px:base_zone, :]
+        per_row = below.mean(axis=1) / 255.0
+        smoothed = _smooth(per_row)
 
-        # Need meaningful difference between top and bottom
-        score_diff = bottom_mean - top_mean
-        if score_diff < 0.10:
-            # Very small difference — either full or empty or ambiguous
-            # For full bottle: both top and bottom have high oil score
-            # Very small score difference: can't reliably determine oil line.
-            # Nearly-full or nearly-empty — let reference handle these cases.
-            continue
+        threshold = 0.06
+        for i in range(len(smoothed)):
+            if smoothed[i] > threshold:
+                oil_line_y = label_bot_px + i
+                yellow_amount = float(smoothed[i:].mean())
+                conf = float(np.clip(0.40 + yellow_amount * 1.5, 0.40, 0.75))
+                logger.info("Yellow-position: oil BELOW label at y=%d (%.1f%%)",
+                            oil_line_y, (1 - oil_line_y / h) * 100)
+                return float(oil_line_y / h), conf, {
+                    "zone": "below_label",
+                    "yellow_density": yellow_amount,
+                }
 
-        # Find the transition: scan from bottom upward
-        # Threshold: midpoint between top and bottom scores
-        threshold = top_mean + score_diff * 0.45
-
-        transition_idx = None
-        for i in range(scan_len - 1, -1, -1):
-            if smoothed[i] < threshold:
-                transition_idx = i
-                break
-
-        if transition_idx is None:
-            continue
-
-        # Skip if the transition is at the very bottom (bottle base) or
-        # very top (cap/neck) — these are not oil surface transitions
-        if transition_idx > scan_len * 0.92 or transition_idx < scan_len * 0.03:
-            continue
-
-        # Validate: check that the region below is indeed higher score
-        validate_below = int(min(scan_len, transition_idx + scan_len * 0.08))
-        validate_above = int(max(0, transition_idx - scan_len * 0.08))
-        if validate_below < scan_len and validate_above >= 0:
-            below_val = float(smoothed[transition_idx:validate_below].mean())
-            above_val = float(smoothed[validate_above:transition_idx].mean())
-            if below_val - above_val < 0.05:
-                # Not a convincing transition
-                continue
-
-        transition_y = y_top + transition_idx
-        # Confidence based on the score difference and trust factor
-        conf = min(0.75, 0.25 + score_diff * 1.5) * trust
-
-        transition_ys.append(transition_y)
-        strip_confs.append(conf)
-
-    if not transition_ys:
-        return None, 0.0, {}
-
-    # Combine results from strips
-    if len(transition_ys) == 2:
-        diff = abs(transition_ys[0] - transition_ys[1]) / h
-        if diff < 0.10:
-            y_combined = np.average(transition_ys, weights=strip_confs)
-            conf_combined = max(strip_confs) * 1.1
-        else:
-            best_idx = int(np.argmax(strip_confs))
-            y_combined = transition_ys[best_idx]
-            conf_combined = strip_confs[best_idx] * 0.8
-    else:
-        y_combined = transition_ys[0]
-        conf_combined = strip_confs[0] * 0.9
-
-    y_relative = float(y_combined) / h
-    conf_combined = float(np.clip(conf_combined, 0.0, 0.75))
-
-    return y_relative, conf_combined, {
-        "method": "side_strips",
-        "num_strips": len(strips),
-        "strip_agreement": len(transition_ys),
-    }
+    # ── No yellow found anywhere → likely empty ──────────────────────
+    return None, 0.0, {"zone": "no_yellow"}
 
 
 # =====================================================================
@@ -1192,13 +1149,19 @@ def _fuse_detections(direct_result, side_strip_result, ref_result, label_zone):
     if side_strip_result and side_strip_result.get("confidence", 0) > 0:
         d = dict(side_strip_result)
         d["name"] = "side_strip"
-        d["base_weight"] = 0.30  # Useful corroboration but noisy on its own
+        # Yellow above the label is unambiguous → high weight
+        # Other zones (strip, below) → moderate weight
+        zone = (side_strip_result.get("meta") or {}).get("zone", "")
+        if zone == "above_label":
+            d["base_weight"] = 0.50  # Very reliable: no label confusion possible
+        else:
+            d["base_weight"] = 0.30  # Moderate: strip/below are less certain
         detections.append(d)
 
     if ref_result and ref_result.get("confidence", 0) > 0:
         d = dict(ref_result)
         d["name"] = "reference"
-        d["base_weight"] = 0.50  # Most reliable: calibrated multi-metric comparison
+        d["base_weight"] = 0.45  # Calibrated multi-metric comparison
         detections.append(d)
 
     if not detections:
@@ -1317,6 +1280,7 @@ def process_bottle_image(image_path: str, bottle_spec):
                 "percentage": _y_rel_to_percentage(ss_y_rel),
                 "confidence": float(ss_conf),
                 "y_rel": ss_y_rel,
+                "meta": side_meta,
             }
     except Exception as exc:
         logger.warning("Side-strip detection failed: %s", exc)
