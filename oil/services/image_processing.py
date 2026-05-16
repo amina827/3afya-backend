@@ -723,21 +723,23 @@ def _fill_ratio_to_ml(ratio):
 
 
 def _draw_overlay(image, cap, oil_result, volume_ml, fill_ratio):
-    """Draw detection overlay on the image."""
+    """Draw detection overlay on the image.
+
+    The yellow bottle bbox and magenta bottom line are intentionally not
+    drawn — the cap-ratio estimate (cap_bot + 9 * cap_h) overshoots on
+    photos where the camera distance differs from the reference set, which
+    on empty-bottle scans put the line well below the visible bottle. The
+    bbox geometry is still returned in the API payload (`bottle_bbox`,
+    `bottle_height_pixels`) so the slider/target feature can draw its own
+    overlay if it wants to.
+    """
     overlay = image.copy()
     bounds = oil_result["bottle_bounds"]
     bx1, by1, bx2, by2 = bounds
 
-    cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (0, 200, 200), 3)
-
-    bot_y = oil_result["bottle_bottom_y"]
-    cv2.line(overlay, (bx1, bot_y), (bx2, bot_y), (255, 0, 255), 3)
-
     if oil_result["has_oil"]:
         oil_y = oil_result["oil_top_y"]
-        # Clamp within bottle bounds
-        oil_y = max(by1, min(oil_y, bot_y))
-        # Draw within bottle bounds only (not full image width)
+        oil_y = max(by1, min(oil_y, by2))
         cv2.line(overlay, (bx1, oil_y), (bx2, oil_y), (0, 0, 255), 4)
 
     h, w = image.shape[:2]
