@@ -183,25 +183,59 @@ def _detect_cap(hsv, image_shape):
 
 
 def _find_label_zone(hsv, cap_bot, bot_y, bl, br):
-    """Find the label region using green color as anchor.
+    """Find the label region using contour detection on combined label colors.
+
+    The Afia label contains green + red + white panels. Detecting only green
+    misses labels where green is partially shadowed/occluded. Build a combined
+    strong-color mask (green + red), close gaps with morphology, then take the
+    largest wide connected component as the label.
 
     Returns (label_top_y, label_bottom_y).
     """
+    body_h = bot_y - cap_bot
+    body_w = br - bl
+
     green = cv2.inRange(hsv, LABEL_GREEN_LOWER, LABEL_GREEN_UPPER)
+    red1 = cv2.inRange(hsv, np.array([0, 80, 60]), np.array([12, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([179, 255, 255]))
+    label_strong = green | red1 | red2
+
+    body_mask = np.zeros_like(label_strong)
+    body_mask[cap_bot:bot_y, bl:br] = label_strong[cap_bot:bot_y, bl:br]
+
+    # Close gaps to merge green/red regions of the same label
+    kernel = np.ones((11, 11), np.uint8)
+    closed = cv2.morphologyEx(body_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    n, _, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
+    best_area = 0
+    best_y = None
+    best_h = 0
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        # Real labels span most of bottle width
+        if w < body_w * 0.30 or area < 800:
+            continue
+        if area > best_area:
+            best_area = area
+            best_y = y
+            best_h = h
+
+    if best_y is not None:
+        return int(best_y), int(best_y + best_h)
+
+    # Fallback 1: green-only detection (original behavior)
     green_body = green.copy()
     green_body[:cap_bot] = 0
     green_body[bot_y:] = 0
     green_body[:, :bl] = 0
     green_body[:, br:] = 0
-
     green_rows = np.sum(green_body > 0, axis=1)
     green_ys = np.where(green_rows > 10)[0]
-
     if len(green_ys) > 0:
         return int(green_ys[0]), int(green_ys[-1])
 
-    # Fallback: assume label starts at 36% and ends at 98% of body
-    body_h = bot_y - cap_bot
+    # Fallback 2: assume label starts at 36% and ends at 98% of body
     return cap_bot + int(body_h * 0.36), cap_bot + int(body_h * 0.98)
 
 
@@ -411,6 +445,60 @@ def _volume_to_fill_ratio(volume_ml):
 
 
 # =====================================================================
+# Meniscus edge detection (oil surface)
+# =====================================================================
+
+
+def _find_horizontal_edges(image, top_y, bot_y, bl, br):
+    """Find prominent horizontal lines (oil surface candidates) in a region.
+
+    Uses Canny + HoughLinesP, filtered to near-horizontal long lines.
+    Returns list of (absolute_y, score) sorted descending by score.
+    """
+    if bot_y <= top_y or br <= bl:
+        return []
+
+    roi = image[top_y:bot_y, bl:br]
+    if roi.size == 0:
+        return []
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+
+    body_w = br - bl
+    min_line_len = max(20, int(body_w * 0.45))
+    max_gap = max(4, int(body_w * 0.12))
+    hough_thresh = max(20, int(body_w * 0.25))
+
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=hough_thresh,
+        minLineLength=min_line_len,
+        maxLineGap=max_gap,
+    )
+    if lines is None:
+        return []
+
+    horiz = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx < min_line_len * 0.8:
+            continue
+        angle_deg = np.degrees(np.arctan2(dy, max(dx, 1)))
+        if angle_deg > 6:
+            continue
+        y_avg = (y1 + y2) / 2
+        score = float(dx) * max(0.1, 1 - angle_deg / 6)
+        horiz.append((int(top_y + y_avg), score))
+
+    horiz.sort(key=lambda t: -t[1])
+    return horiz
+
+
+# =====================================================================
 # Main detection orchestrator
 # =====================================================================
 
@@ -428,14 +516,16 @@ def _compute_body_oil_excl_pct(hsv, cap_bot, bot_y, bl, br):
 
     oil_mask = cv2.inRange(body_hsv, OIL_HSV_LOWER, OIL_HSV_UPPER)
 
-    # Build label exclusion mask (green + red + white label areas)
+    # Build label exclusion mask (green + red + white label areas).
+    # Wider HSV ranges than before to catch shaded label edges; more dilation
+    # iterations to cover the label's drop-shadow on the bottle.
     green = cv2.inRange(body_hsv, LABEL_GREEN_LOWER, LABEL_GREEN_UPPER)
-    red1 = cv2.inRange(body_hsv, np.array([0, 100, 70]), np.array([10, 255, 255]))
-    red2 = cv2.inRange(body_hsv, np.array([160, 100, 70]), np.array([179, 255, 255]))
-    white = cv2.inRange(body_hsv, np.array([0, 0, 180]), np.array([179, 40, 255]))
+    red1 = cv2.inRange(body_hsv, np.array([0, 80, 60]), np.array([12, 255, 255]))
+    red2 = cv2.inRange(body_hsv, np.array([160, 80, 60]), np.array([179, 255, 255]))
+    white = cv2.inRange(body_hsv, np.array([0, 0, 170]), np.array([179, 50, 255]))
     label_mask = green | red1 | red2 | white
-    kernel = np.ones((5, 5), np.uint8)
-    label_dilated = cv2.dilate(label_mask, kernel, iterations=2)
+    kernel = np.ones((7, 7), np.uint8)
+    label_dilated = cv2.dilate(label_mask, kernel, iterations=3)
 
     oil_excl = oil_mask.copy()
     oil_excl[label_dilated > 0] = 0
@@ -492,6 +582,20 @@ def _detect_oil_level(image, hsv, cap):
         strip_confirmed = (strip_chk is not None and raw_f25 > 0.40)
 
         if strip_confirmed:
+            # Cross-validate with meniscus edge: a real oil surface produces
+            # a sharp horizontal Canny edge within ±15px of the HSV-detected
+            # top. If no such edge exists, the "oil" is likely a soft color
+            # gradient from background through clear plastic — downgrade to
+            # medium confidence rather than reporting "high".
+            edges_near = _find_horizontal_edges(
+                image,
+                max(cap_bot, above_oil_top - 15),
+                min(label_top, above_oil_top + 15),
+                bottle_left, bottle_right,
+            )
+            body_w = bottle_right - bottle_left
+            has_meniscus = any(e[1] >= body_w * 0.35 for e in edges_near)
+
             return {
                 "has_oil": True,
                 "oil_top_y": above_oil_top,
@@ -499,8 +603,12 @@ def _detect_oil_level(image, hsv, cap):
                 "bottle_bottom_y": bottle_bottom_y,
                 "bottle_height_px": bottle_height,
                 "bottle_bounds": bounds,
-                "confidence": "high",
-                "confidence_note": "Oil visible above label — reliable reading.",
+                "confidence": "high" if has_meniscus else "medium",
+                "confidence_note": (
+                    "Oil visible above label — meniscus edge confirmed."
+                    if has_meniscus else
+                    "Oil visible above label — soft edge (no sharp meniscus)."
+                ),
                 "detection_zone": "above_label",
             }
         else:
@@ -508,7 +616,8 @@ def _detect_oil_level(image, hsv, cap):
             # from background. Fall through to side strip detection.
             logger.info(
                 "Above-label rejected: side strip not confirmed "
-                "(strip_r=%.3f, method=%s)", strip_r, strip_method
+                "(strip_r=%.3f, method=%s)",
+                strip_r, strip_nfo.get("method", "?"),
             )
 
     # Step 3: Side strip with dual-threshold validation
