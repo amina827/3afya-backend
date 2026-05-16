@@ -214,6 +214,8 @@ def _scan_above_label(hsv, cap_bot, label_top, bl, br, body_h):
     """Scan the clear zone above the label for oil.
 
     Returns (oil_top_y, fill_ratio) or (None, 0.0) if no oil found.
+    Requires at least MIN_CONSEC consecutive rows above threshold to avoid
+    false positives from background colors through clear plastic.
     """
     if label_top <= cap_bot + 20:
         return None, 0.0
@@ -233,16 +235,32 @@ def _scan_above_label(hsv, cap_bot, label_top, bl, br, body_h):
         return None, 0.0
     smoothed = np.convolve(row_counts, np.ones(ks) / ks, mode="same")
 
-    # Proportional threshold: 8% of bottle width
+    # Proportional threshold: 15% of bottle width (was 8%, too sensitive)
     bottle_w = br - bl
-    threshold = max(20, int(bottle_w * 0.08))
+    threshold = max(30, int(bottle_w * 0.15))
 
-    # Find topmost row with oil
+    # Require MIN_CONSEC consecutive rows above threshold
+    # Real oil creates a continuous band; reflections/background are scattered
+    MIN_CONSEC = 20
+    run_start = None
+    run_len = 0
     for y in range(cap_bot, label_top):
         if smoothed[y] >= threshold:
-            bot_y = cap_bot + body_h
-            fill_ratio = (bot_y - y) / body_h
-            return int(y), float(fill_ratio)
+            if run_start is None:
+                run_start = y
+            run_len += 1
+        else:
+            if run_len >= MIN_CONSEC:
+                bot_y = cap_bot + body_h
+                fill_ratio = (bot_y - run_start) / body_h
+                return int(run_start), float(fill_ratio)
+            run_start = None
+            run_len = 0
+    # Check final run
+    if run_len >= MIN_CONSEC and run_start is not None:
+        bot_y = cap_bot + body_h
+        fill_ratio = (bot_y - run_start) / body_h
+        return int(run_start), float(fill_ratio)
 
     return None, 0.0
 
@@ -461,17 +479,37 @@ def _detect_oil_level(image, hsv, cap):
     )
 
     if above_oil_top is not None and above_ratio > 0.60:
-        return {
-            "has_oil": True,
-            "oil_top_y": above_oil_top,
-            "fill_ratio": above_ratio,
-            "bottle_bottom_y": bottle_bottom_y,
-            "bottle_height_px": bottle_height,
-            "bottle_bounds": bounds,
-            "confidence": "high",
-            "confidence_note": "Oil visible above label — reliable reading.",
-            "detection_zone": "above_label",
-        }
+        # Cross-validate: for real 1200-1500ml, side strips MUST also show
+        # substantial stable oil. Background colors (granite/wood/wall) showing
+        # through clear plastic can trigger false above-label on empty bottles.
+        strip_chk, strip_r, strip_nfo = _scan_side_strips(
+            hsv, cap_bot, bottle_bottom_y, bottle_left, bottle_right, bottle_height
+        )
+        # For real high-fill bottles, side strip WILL detect oil (raw f25 > 0.40).
+        # For empty bottles with background false positives, side strip returns None
+        # (density check fails) or has very low f25.
+        raw_f25 = strip_nfo.get("f25", 0.0)
+        strip_confirmed = (strip_chk is not None and raw_f25 > 0.40)
+
+        if strip_confirmed:
+            return {
+                "has_oil": True,
+                "oil_top_y": above_oil_top,
+                "fill_ratio": above_ratio,
+                "bottle_bottom_y": bottle_bottom_y,
+                "bottle_height_px": bottle_height,
+                "bottle_bounds": bounds,
+                "confidence": "high",
+                "confidence_note": "Oil visible above label — reliable reading.",
+                "detection_zone": "above_label",
+            }
+        else:
+            # Above-label found "oil" but side strips disagree — false positive
+            # from background. Fall through to side strip detection.
+            logger.info(
+                "Above-label rejected: side strip not confirmed "
+                "(strip_r=%.3f, method=%s)", strip_r, strip_method
+            )
 
     # Step 3: Side strip with dual-threshold validation
     strip_oil_top, strip_ratio, strip_info = _scan_side_strips(
@@ -588,7 +626,10 @@ def _draw_overlay(image, cap, oil_result, volume_ml, fill_ratio):
 
     if oil_result["has_oil"]:
         oil_y = oil_result["oil_top_y"]
-        cv2.line(overlay, (0, oil_y), (image.shape[1], oil_y), (0, 0, 255), 4)
+        # Clamp within bottle bounds
+        oil_y = max(by1, min(oil_y, bot_y))
+        # Draw within bottle bounds only (not full image width)
+        cv2.line(overlay, (bx1, oil_y), (bx2, oil_y), (0, 0, 255), 4)
 
     h, w = image.shape[:2]
     fs = max(0.6, min(1.2, w / 600.0))
